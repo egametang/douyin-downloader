@@ -32,6 +32,10 @@ class FileManager:
         folderstyle: bool = True,
         download_date: str = "",
     ) -> Path:
+        if not folderstyle:
+            self.base_path.mkdir(parents=True, exist_ok=True)
+            return self.base_path
+
         safe_author = sanitize_filename(author_name)
 
         if mode:

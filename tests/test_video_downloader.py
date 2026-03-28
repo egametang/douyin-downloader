@@ -137,6 +137,190 @@ async def test_build_no_watermark_url_signs_with_headers(tmp_path, monkeypatch):
     await api_client.close()
 
 
+def test_build_default_original_source_request_uses_default_ratio(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    captured = {}
+
+    def _fake_build_signed_path(path: str, params):
+        captured["path"] = path
+        captured["params"] = params
+        return "https://www.douyin.com/aweme/v1/play/?video_id=1&X-Bogus=signed", "UnitTestAgent/1.0"
+
+    monkeypatch.setattr(api_client, "build_signed_path", _fake_build_signed_path)
+
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "play_addr": {
+                "uri": "video_uri_1",
+                "height": 720,
+                "width": 1280,
+                "url_list": [
+                    "https://www.douyin.com/aweme/v1/play/?video_id=top_level_default"
+                ],
+            }
+        },
+    }
+
+    url, headers = downloader._build_default_original_source_request(aweme)
+
+    assert captured["path"] == "/aweme/v1/play/"
+    assert captured["params"] == {
+        "video_id": "video_uri_1",
+        "ratio": "default",
+        "line": "0",
+        "is_play_url": "1",
+        "watermark": "0",
+        "source": "PackSourceEnum_PUBLISH",
+    }
+    assert url.endswith("X-Bogus=signed")
+    assert headers["User-Agent"] == "UnitTestAgent/1.0"
+
+    asyncio.run(api_client.close())
+
+
+@pytest.mark.asyncio
+async def test_build_no_watermark_url_prefers_highest_quality_progressive_variant(
+    tmp_path, monkeypatch
+):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    signed_inputs = []
+
+    def _fake_sign(url: str):
+        signed_inputs.append(url)
+        return f"{url}&X-Bogus=signed", "UnitTestAgent/1.0"
+
+    monkeypatch.setattr(api_client, "sign_url", _fake_sign)
+
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "play_addr": {
+                "height": 720,
+                "width": 1280,
+                "url_list": [
+                    "https://www.douyin.com/aweme/v1/play/?video_id=top_level_default"
+                ],
+            },
+            "bit_rate": [
+                {
+                    "format": "dash",
+                    "bit_rate": 9999999,
+                    "quality_type": 99,
+                    "is_h265": 1,
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://www.douyin.com/aweme/v1/play/dash/?video_id=dash_only"
+                        ],
+                    },
+                },
+                {
+                    "format": "mp4",
+                    "bit_rate": 1200000,
+                    "quality_type": 10,
+                    "is_h265": 0,
+                    "play_addr": {
+                        "height": 720,
+                        "width": 1280,
+                        "url_list": [
+                            "https://www.douyin.com/aweme/v1/play/?video_id=mid_quality"
+                        ],
+                    },
+                },
+                {
+                    "format": "mp4",
+                    "bit_rate": 1800000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://www.douyin.com/aweme/v1/play/?video_id=best_quality"
+                        ],
+                    },
+                },
+            ],
+        },
+    }
+
+    url, headers = downloader._build_no_watermark_url(aweme)
+
+    assert signed_inputs == [
+        "https://www.douyin.com/aweme/v1/play/?video_id=best_quality"
+    ]
+    assert url.endswith("&X-Bogus=signed")
+    assert headers["User-Agent"] == "UnitTestAgent/1.0"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_build_video_download_plan_prefers_dash_original_bundle(tmp_path):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.media_muxer.is_available = MagicMock(return_value=True)
+
+    aweme = {
+        "aweme_id": "1",
+        "video": {
+            "bit_rate_audio": [
+                {
+                    "audio_quality": 6,
+                    "audio_meta": {
+                        "file_id": "audio_4k",
+                        "bitrate": 64000,
+                        "size": 123456,
+                        "url_list": {
+                            "main_url": "https://cdn.example.com/audio_4k.m4a",
+                        },
+                    },
+                }
+            ],
+            "bit_rate": [
+                {
+                    "format": "mp4",
+                    "bit_rate": 1800000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://cdn.example.com/progressive_4k.mp4",
+                        ],
+                    },
+                },
+                {
+                    "format": "dash",
+                    "bit_rate": 1500000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "video_extra": json.dumps({"audio_file_id": "audio_4k"}),
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://cdn.example.com/original_4k_video.mp4",
+                        ],
+                    },
+                },
+            ],
+        },
+    }
+
+    plan = downloader._build_video_download_plan(aweme)
+
+    assert plan["kind"] == "dash"
+    assert plan["video_url"] == "https://cdn.example.com/original_4k_video.mp4"
+    assert plan["audio_url"] == "https://cdn.example.com/audio_4k.m4a"
+
+    await api_client.close()
+
+
 @pytest.mark.asyncio
 async def test_should_download_skips_when_aweme_exists_locally(tmp_path):
     downloader, api_client = _build_downloader(tmp_path)
@@ -312,6 +496,327 @@ async def test_download_aweme_assets_video_writes_cover_avatar_and_json(
     assert any(path.name.endswith("_avatar.jpg") for path in saved_paths)
     metadata_files = list(tmp_path.rglob("*_data.json"))
     assert len(metadata_files) == 1
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_download_aweme_assets_prefers_dash_and_muxes_original_video(
+    tmp_path, monkeypatch
+):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=True,
+        transcript={"enabled": False},
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+    downloader.media_muxer.is_available = MagicMock(return_value=True)
+
+    saved_paths = []
+
+    async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
+        saved_paths.append(save_path)
+        return True
+
+    async def _fake_mux(_video_path, _audio_path, _output_path):
+        return True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(
+        downloader, VideoDownloader
+    )
+    downloader.media_muxer.mux_mp4 = _fake_mux
+
+    aweme_id = "7600224486650121888"
+    publish_ts = 1707303025
+    aweme_data = {
+        "aweme_id": aweme_id,
+        "desc": "优先原版视频",
+        "create_time": publish_ts,
+        "video": {
+            "bit_rate_audio": [
+                {
+                    "audio_quality": 6,
+                    "audio_meta": {
+                        "file_id": "audio_original",
+                        "bitrate": 64000,
+                        "size": 456789,
+                        "url_list": {
+                            "main_url": "https://cdn.example.com/audio_original.m4a"
+                        },
+                    },
+                }
+            ],
+            "bit_rate": [
+                {
+                    "format": "mp4",
+                    "bit_rate": 1800000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://cdn.example.com/progressive_4k.mp4"
+                        ],
+                    },
+                },
+                {
+                    "format": "dash",
+                    "bit_rate": 1500000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "video_extra": json.dumps({"audio_file_id": "audio_original"}),
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://cdn.example.com/original_4k_video.mp4"
+                        ],
+                    },
+                },
+            ],
+        },
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    assert len(saved_paths) == 2
+    assert any("__dash_video__.mp4" in str(path) for path in saved_paths)
+    assert any("__dash_audio__.m4a" in str(path) for path in saved_paths)
+
+    manifest_path = tmp_path / "download_manifest.jsonl"
+    manifest_entry = json.loads(
+        manifest_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert manifest_entry["aweme_id"] == aweme_id
+    assert manifest_entry["download_variant"] == "dash_original"
+    assert manifest_entry["file_names"] == [f"2024-02-07_优先原版视频_{aweme_id}.mp4"]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_download_aweme_assets_prefers_default_original_source_before_dash(
+    tmp_path, monkeypatch
+):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=True,
+        transcript={"enabled": False},
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+    downloader.media_muxer.is_available = MagicMock(return_value=True)
+
+    saved_urls = []
+
+    async def _fake_download_with_retry(self, url, save_path, _session, **_kwargs):
+        saved_urls.append((url, save_path.name))
+        return True
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(
+        downloader, VideoDownloader
+    )
+
+    aweme_id = "7600224486650121777"
+    aweme_data = {
+        "aweme_id": aweme_id,
+        "desc": "优先默认原始源",
+        "create_time": 1707303025,
+        "video": {
+            "play_addr": {
+                "uri": "video_uri_1",
+                "height": 1920,
+                "width": 1080,
+                "url_list": [
+                    "https://www.douyin.com/aweme/v1/play/?video_id=progressive_default"
+                ],
+            },
+            "bit_rate_audio": [
+                {
+                    "audio_quality": 6,
+                    "audio_meta": {
+                        "file_id": "audio_original",
+                        "bitrate": 64000,
+                        "size": 456789,
+                        "url_list": {
+                            "main_url": "https://cdn.example.com/audio_original.m4a"
+                        },
+                    },
+                }
+            ],
+            "bit_rate": [
+                {
+                    "format": "dash",
+                    "bit_rate": 1500000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "video_extra": json.dumps({"audio_file_id": "audio_original"}),
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://cdn.example.com/original_4k_video.mp4"
+                        ],
+                    },
+                }
+            ],
+        },
+    }
+
+    def _fake_build_signed_path(path: str, params):
+        assert path == "/aweme/v1/play/"
+        assert params["video_id"] == "video_uri_1"
+        assert params["ratio"] == "default"
+        return "https://www.douyin.com/aweme/v1/play/?video_id=video_uri_1&ratio=default&X-Bogus=signed", "UnitTestAgent/1.0"
+
+    monkeypatch.setattr(api_client, "build_signed_path", _fake_build_signed_path)
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    assert saved_urls == [
+        (
+            "https://www.douyin.com/aweme/v1/play/?video_id=video_uri_1&ratio=default&X-Bogus=signed",
+            f"2024-02-07_优先默认原始源_{aweme_id}.mp4",
+        )
+    ]
+
+    manifest_path = tmp_path / "download_manifest.jsonl"
+    manifest_entry = json.loads(
+        manifest_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert manifest_entry["download_variant"] == "play_default_original"
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_download_aweme_assets_falls_back_to_progressive_when_dash_fails(
+    tmp_path, monkeypatch
+):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False,
+        cover=False,
+        avatar=False,
+        json=False,
+        folderstyle=True,
+        transcript={"enabled": False},
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+    downloader.media_muxer.is_available = MagicMock(return_value=True)
+
+    saved_urls = []
+
+    async def _fake_download_with_retry(self, url, _save_path, _session, **_kwargs):
+        saved_urls.append(url)
+        return True
+
+    async def _fake_mux(_video_path, _audio_path, _output_path):
+        return False
+
+    downloader._download_with_retry = _fake_download_with_retry.__get__(
+        downloader, VideoDownloader
+    )
+    downloader.media_muxer.mux_mp4 = _fake_mux
+
+    aweme_data = {
+        "aweme_id": "7600224486650121999",
+        "desc": "原版失败自动回退",
+        "video": {
+            "bit_rate_audio": [
+                {
+                    "audio_quality": 6,
+                    "audio_meta": {
+                        "file_id": "audio_original",
+                        "bitrate": 64000,
+                        "size": 456789,
+                        "url_list": {
+                            "main_url": "https://cdn.example.com/audio_original.m4a"
+                        },
+                    },
+                }
+            ],
+            "play_addr": {
+                "height": 720,
+                "width": 1280,
+                "url_list": [
+                    "https://www.douyin.com/aweme/v1/play/?video_id=progressive_default"
+                ],
+            },
+            "bit_rate": [
+                {
+                    "format": "mp4",
+                    "bit_rate": 1200000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://www.douyin.com/aweme/v1/play/?video_id=best_progressive"
+                        ],
+                    },
+                },
+                {
+                    "format": "dash",
+                    "bit_rate": 1500000,
+                    "quality_type": 72,
+                    "is_h265": 1,
+                    "video_extra": json.dumps({"audio_file_id": "audio_original"}),
+                    "play_addr": {
+                        "height": 2160,
+                        "width": 3840,
+                        "url_list": [
+                            "https://cdn.example.com/original_4k_video.mp4"
+                        ],
+                    },
+                },
+            ],
+        },
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    assert saved_urls[:2] == [
+        "https://cdn.example.com/original_4k_video.mp4",
+        "https://cdn.example.com/audio_original.m4a",
+    ]
+    assert "best_progressive" in saved_urls[-1]
+
+    manifest_path = tmp_path / "download_manifest.jsonl"
+    manifest_entry = json.loads(
+        manifest_path.read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert manifest_entry["download_variant"] == "progressive_mp4"
 
     await api_client.close()
 

@@ -3,7 +3,7 @@ import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 from urllib.parse import urlparse
 
 from auth import CookieManager
@@ -13,6 +13,7 @@ from core.api_client import DouyinAPIClient
 from core.transcript_manager import TranscriptManager
 from storage import Database, FileManager, MetadataHandler
 from utils.logger import setup_logger
+from utils.media_muxer import MediaMuxer
 from utils.validators import sanitize_filename
 
 logger = setup_logger("BaseDownloader")
@@ -67,6 +68,7 @@ class BaseDownloader(ABC):
         self.transcript_manager = TranscriptManager(
             self.config, self.file_manager, self.database
         )
+        self.media_muxer = MediaMuxer()
         self._local_aweme_ids: Optional[set[str]] = None
         self._aweme_id_pattern = re.compile(r"(?<!\d)(\d{15,20})(?!\d)")
         self._local_media_suffixes = {
@@ -268,20 +270,62 @@ class BaseDownloader(ABC):
 
         session = await self.api_client.get_session()
         video_path: Optional[Path] = None
+        video_variant: Optional[str] = None
 
         media_type = self._detect_media_type(aweme_data)
         if media_type == "video":
-            video_info = self._build_no_watermark_url(aweme_data)
-            if not video_info:
+            original_request = self._build_default_original_source_request(aweme_data)
+            video_plan = self._build_video_download_plan(aweme_data)
+            if not original_request and not video_plan:
                 logger.error("No playable video URL found for aweme %s", aweme_id)
                 return False
 
-            video_url, video_headers = video_info
             video_path = save_dir / f"{file_stem}.mp4"
-            if not await self._download_with_retry(
-                video_url, video_path, session, headers=video_headers
-            ):
-                return False
+            if original_request:
+                if await self._download_with_retry(
+                    original_request[0],
+                    video_path,
+                    session,
+                    headers=original_request[1],
+                ):
+                    video_variant = "play_default_original"
+                else:
+                    logger.warning(
+                        "Default original source download failed for aweme %s, fallback to DASH/progressive",
+                        aweme_id,
+                    )
+
+            if video_variant is None and video_plan is not None:
+                if video_plan.get("kind") == "dash":
+                    if not await self._download_dash_video(
+                        video_plan, video_path, session, str(aweme_id)
+                    ):
+                        logger.warning(
+                            "Original DASH download failed for aweme %s, fallback to progressive MP4",
+                            aweme_id,
+                        )
+                        fallback_request = self._build_no_watermark_url(aweme_data)
+                        if not fallback_request:
+                            return False
+                        if not await self._download_with_retry(
+                            fallback_request[0],
+                            video_path,
+                            session,
+                            headers=fallback_request[1],
+                        ):
+                            return False
+                        video_variant = "progressive_mp4"
+                    else:
+                        video_variant = "dash_original"
+                else:
+                    video_url = str(video_plan.get("video_url") or "")
+                    video_headers = video_plan.get("video_headers")
+                    if not await self._download_with_retry(
+                        video_url, video_path, session, headers=video_headers
+                    ):
+                        return False
+                    video_variant = "progressive_mp4"
+
             downloaded_files.append(video_path)
 
             if self.config.get("cover"):
@@ -418,6 +462,8 @@ class BaseDownloader(ABC):
             "file_names": [path.name for path in downloaded_files],
             "file_paths": [self._to_manifest_path(path) for path in downloaded_files],
         }
+        if video_variant:
+            manifest_record["download_variant"] = video_variant
         if publish_ts:
             manifest_record["publish_timestamp"] = publish_ts
         await self.metadata_handler.append_download_manifest(
@@ -456,7 +502,7 @@ class BaseDownloader(ABC):
         optional: bool = False,
         prefer_response_content_type: bool = False,
         return_saved_path: bool = False,
-    ) -> bool | Path:
+    ) -> Union[bool, Path]:
         async def _task():
             download_result = await self.file_manager.download_file(
                 url,
@@ -480,6 +526,48 @@ class BaseDownloader(ABC):
                 f"Download error for {save_path.name}: {error}",
             )
             return False
+
+    async def _download_dash_video(
+        self,
+        video_plan: Dict[str, Any],
+        video_path: Path,
+        session,
+        aweme_id: str,
+    ) -> bool:
+        temp_video_path = video_path.with_name(f"{video_path.stem}.__dash_video__.mp4")
+        temp_audio_path = video_path.with_name(f"{video_path.stem}.__dash_audio__.m4a")
+
+        for temp_path in (temp_video_path, temp_audio_path):
+            temp_path.unlink(missing_ok=True)
+
+        try:
+            if not await self._download_with_retry(
+                str(video_plan.get("video_url") or ""),
+                temp_video_path,
+                session,
+                headers=video_plan.get("video_headers"),
+            ):
+                return False
+
+            if not await self._download_with_retry(
+                str(video_plan.get("audio_url") or ""),
+                temp_audio_path,
+                session,
+                headers=video_plan.get("audio_headers"),
+            ):
+                return False
+
+            if not await self.media_muxer.mux_mp4(
+                temp_video_path, temp_audio_path, video_path
+            ):
+                logger.error("Failed to mux original DASH video for aweme %s", aweme_id)
+                return False
+
+            logger.info("Downloaded original DASH video for aweme %s", aweme_id)
+            return True
+        finally:
+            temp_video_path.unlink(missing_ok=True)
+            temp_audio_path.unlink(missing_ok=True)
 
     # aweme_type codes that indicate image/note content
     _GALLERY_AWEME_TYPES = {2, 68, 150}
@@ -505,24 +593,10 @@ class BaseDownloader(ABC):
         self, aweme_data: Dict[str, Any]
     ) -> Optional[Tuple[str, Dict[str, str]]]:
         video = aweme_data.get("video", {})
-        play_addr = video.get("play_addr", {})
-        url_candidates = [c for c in (play_addr.get("url_list") or []) if c]
-        url_candidates.sort(key=lambda u: 0 if "watermark=0" in u else 1)
-
-        fallback_candidate: Optional[Tuple[str, Dict[str, str]]] = None
-
-        for candidate in url_candidates:
-            parsed = urlparse(candidate)
-            headers = self._download_headers()
-
-            if parsed.netloc.endswith("douyin.com"):
-                if "X-Bogus=" not in candidate:
-                    signed_url, ua = self.api_client.sign_url(candidate)
-                    headers = self._download_headers(user_agent=ua)
-                    return signed_url, headers
-                return candidate, headers
-
-            fallback_candidate = (candidate, headers)
+        play_addr = self._select_best_video_play_addr(video)
+        request = self._prepare_download_request(play_addr.get("url_list") or [])
+        if request:
+            return request
 
         uri = (
             play_addr.get("uri")
@@ -532,7 +606,7 @@ class BaseDownloader(ABC):
         if uri:
             params = {
                 "video_id": uri,
-                "ratio": "1080p",
+                "ratio": self._infer_video_ratio(play_addr),
                 "line": "0",
                 "is_play_url": "1",
                 "watermark": "0",
@@ -543,10 +617,294 @@ class BaseDownloader(ABC):
             )
             return signed_url, self._download_headers(user_agent=ua)
 
-        if fallback_candidate:
-            return fallback_candidate
-
         return None
+
+    def _build_default_original_source_request(
+        self, aweme_data: Dict[str, Any]
+    ) -> Optional[Tuple[str, Dict[str, str]]]:
+        video = aweme_data.get("video", {})
+        if not isinstance(video, dict):
+            return None
+
+        uri = self._extract_preferred_video_uri(video)
+        if not uri:
+            return None
+
+        params = {
+            "video_id": uri,
+            "ratio": "default",
+            "line": "0",
+            "is_play_url": "1",
+            "watermark": "0",
+            "source": "PackSourceEnum_PUBLISH",
+        }
+        signed_url, ua = self.api_client.build_signed_path("/aweme/v1/play/", params)
+        return signed_url, self._download_headers(user_agent=ua)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _build_video_download_plan(
+        self, aweme_data: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        video = aweme_data.get("video", {})
+        if isinstance(video, dict) and self.media_muxer.is_available():
+            dash_bundle = self._select_best_dash_video_bundle(video)
+            if dash_bundle:
+                video_request = self._prepare_direct_download_request(
+                    dash_bundle.get("video_urls") or []
+                )
+                audio_request = self._prepare_direct_download_request(
+                    dash_bundle.get("audio_urls") or []
+                )
+                if video_request and audio_request:
+                    return {
+                        "kind": "dash",
+                        "video_url": video_request[0],
+                        "video_headers": video_request[1],
+                        "audio_url": audio_request[0],
+                        "audio_headers": audio_request[1],
+                    }
+
+        direct_request = self._build_no_watermark_url(aweme_data)
+        if not direct_request:
+            return None
+
+        return {
+            "kind": "direct",
+            "video_url": direct_request[0],
+            "video_headers": direct_request[1],
+        }
+
+    def _extract_preferred_video_uri(self, video: Dict[str, Any]) -> str:
+        play_addr = video.get("play_addr")
+        play_addr_265 = video.get("play_addr_265")
+        play_addr_h264 = video.get("play_addr_h264")
+        best_play_addr = self._select_best_video_play_addr(video)
+
+        for candidate in (
+            play_addr.get("uri") if isinstance(play_addr, dict) else None,
+            play_addr_265.get("uri") if isinstance(play_addr_265, dict) else None,
+            play_addr_h264.get("uri") if isinstance(play_addr_h264, dict) else None,
+            best_play_addr.get("uri") if isinstance(best_play_addr, dict) else None,
+            video.get("vid"),
+            (video.get("download_addr") or {}).get("uri")
+            if isinstance(video.get("download_addr"), dict)
+            else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return ""
+
+    def _prepare_download_request(
+        self, url_candidates: List[str]
+    ) -> Optional[Tuple[str, Dict[str, str]]]:
+        normalized_candidates = [c for c in url_candidates if c]
+        normalized_candidates.sort(key=lambda u: 0 if "watermark=0" in u else 1)
+
+        fallback_candidate: Optional[Tuple[str, Dict[str, str]]] = None
+
+        for candidate in normalized_candidates:
+            parsed = urlparse(candidate)
+            headers = self._download_headers()
+
+            if parsed.netloc.endswith("douyin.com"):
+                if "X-Bogus=" not in candidate:
+                    signed_url, ua = self.api_client.sign_url(candidate)
+                    headers = self._download_headers(user_agent=ua)
+                    return signed_url, headers
+                return candidate, headers
+
+            if fallback_candidate is None:
+                fallback_candidate = (candidate, headers)
+
+        return fallback_candidate
+
+    def _prepare_direct_download_request(
+        self, url_candidates: List[str]
+    ) -> Optional[Tuple[str, Dict[str, str]]]:
+        normalized_candidates = [c for c in url_candidates if c]
+        normalized_candidates.sort(key=lambda u: 0 if "watermark=0" in u else 1)
+
+        fallback_candidate: Optional[Tuple[str, Dict[str, str]]] = None
+
+        for candidate in normalized_candidates:
+            parsed = urlparse(candidate)
+            headers = self._download_headers()
+
+            if not parsed.netloc.endswith("douyin.com"):
+                return candidate, headers
+
+            if fallback_candidate is None:
+                if "X-Bogus=" not in candidate:
+                    signed_url, ua = self.api_client.sign_url(candidate)
+                    headers = self._download_headers(user_agent=ua)
+                    fallback_candidate = (signed_url, headers)
+                else:
+                    fallback_candidate = (candidate, headers)
+
+        return fallback_candidate
+
+    def _select_best_dash_video_bundle(
+        self, video: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        audio_variants = self._collect_dash_audio_variants(video)
+        if not audio_variants:
+            return None
+
+        candidates: List[Tuple[Tuple[int, int, int, int, int, int], Dict[str, Any]]] = []
+
+        for variant in video.get("bit_rate") or []:
+            if not isinstance(variant, dict):
+                continue
+            if str(variant.get("format") or "").lower() != "dash":
+                continue
+
+            play_addr = variant.get("play_addr")
+            if not isinstance(play_addr, dict):
+                continue
+
+            video_urls = self._extract_url_candidates(play_addr)
+            if not video_urls:
+                continue
+
+            matched_audio = self._match_dash_audio_variant(variant, audio_variants)
+            if not matched_audio:
+                continue
+
+            candidates.append(
+                (
+                    self._score_video_variant(variant, play_addr),
+                    {
+                        "variant": variant,
+                        "play_addr": play_addr,
+                        "video_urls": video_urls,
+                        "audio_urls": matched_audio["audio_urls"],
+                    },
+                )
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def _collect_dash_audio_variants(
+        self, video: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        variants: List[Dict[str, Any]] = []
+
+        for item in video.get("bit_rate_audio") or []:
+            if not isinstance(item, dict):
+                continue
+
+            audio_meta = item.get("audio_meta")
+            if not isinstance(audio_meta, dict):
+                continue
+
+            audio_urls = self._extract_url_candidates(
+                audio_meta.get("url_list"), audio_meta
+            )
+            if not audio_urls:
+                continue
+
+            variants.append(
+                {
+                    "item": item,
+                    "audio_meta": audio_meta,
+                    "audio_urls": audio_urls,
+                }
+            )
+
+        variants.sort(key=self._score_audio_variant, reverse=True)
+        return variants
+
+    def _match_dash_audio_variant(
+        self, variant: Dict[str, Any], audio_variants: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        video_extra = self._parse_json_dict(variant.get("video_extra"))
+        target_audio_file_id = str(video_extra.get("audio_file_id") or "").strip()
+
+        if target_audio_file_id:
+            for audio_variant in audio_variants:
+                audio_meta = audio_variant.get("audio_meta") or {}
+                if str(audio_meta.get("file_id") or "").strip() == target_audio_file_id:
+                    return audio_variant
+
+        return audio_variants[0] if audio_variants else None
+
+    def _score_audio_variant(self, entry: Dict[str, Any]) -> Tuple[int, int, int]:
+        audio_meta = entry.get("audio_meta") or {}
+        item = entry.get("item") or {}
+        return (
+            self._coerce_int(audio_meta.get("bitrate")),
+            self._coerce_int(audio_meta.get("size")),
+            self._coerce_int(item.get("audio_quality")),
+        )
+
+    @staticmethod
+    def _parse_json_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str) or not value.strip():
+            return {}
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _select_best_video_play_addr(self, video: Dict[str, Any]) -> Dict[str, Any]:
+        candidates: List[Tuple[Tuple[int, int, int, int, int, int], Dict[str, Any]]] = []
+
+        for variant in video.get("bit_rate") or []:
+            if not isinstance(variant, dict):
+                continue
+            if str(variant.get("format") or "").lower() == "dash":
+                # dash 流通常需要额外音轨拼接；这里优先选择可直接下载成单个 mp4 的最高质量版本。
+                continue
+            play_addr = variant.get("play_addr")
+            if not isinstance(play_addr, dict):
+                continue
+            if not (play_addr.get("url_list") or []):
+                continue
+            candidates.append((self._score_video_variant(variant, play_addr), play_addr))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            return candidates[0][1]
+
+        play_addr = video.get("play_addr", {})
+        return play_addr if isinstance(play_addr, dict) else {}
+
+    def _score_video_variant(
+        self, variant: Dict[str, Any], play_addr: Dict[str, Any]
+    ) -> Tuple[int, int, int, int, int, int]:
+        return (
+            self._coerce_int(play_addr.get("height")),
+            self._coerce_int(play_addr.get("width")),
+            self._coerce_int(variant.get("bit_rate")),
+            self._coerce_int(play_addr.get("data_size")),
+            self._coerce_int(variant.get("quality_type")),
+            1 if variant.get("is_h265") else 0,
+        )
+
+    def _infer_video_ratio(self, play_addr: Dict[str, Any]) -> str:
+        height = self._coerce_int(play_addr.get("height"))
+        if height >= 2160:
+            return "2160p"
+        if height >= 1440:
+            return "1440p"
+        if height >= 1080:
+            return "1080p"
+        if height >= 720:
+            return "720p"
+        return "540p"
 
     def _collect_image_urls(self, aweme_data: Dict[str, Any]) -> List[str]:
         image_urls = []
@@ -639,19 +997,47 @@ class BaseDownloader(ABC):
 
     @staticmethod
     def _extract_first_url(source: Any) -> Optional[str]:
-        if isinstance(source, dict):
-            url_list = source.get("url_list")
-            if isinstance(url_list, list) and url_list:
-                first_item = url_list[0]
-                if isinstance(first_item, str) and first_item:
-                    return first_item
-        elif isinstance(source, list) and source:
-            first_item = source[0]
-            if isinstance(first_item, str) and first_item:
-                return first_item
-        elif isinstance(source, str) and source:
-            return source
-        return None
+        candidates = BaseDownloader._extract_url_candidates(source)
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _extract_url_candidates(*sources: Any) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def _append(url: Any) -> None:
+            if not isinstance(url, str) or not url:
+                return
+            if url in seen:
+                return
+            seen.add(url)
+            candidates.append(url)
+
+        def _collect(source: Any) -> None:
+            if isinstance(source, dict):
+                url_list = source.get("url_list")
+                if isinstance(url_list, list):
+                    for item in url_list:
+                        _collect(item)
+                elif isinstance(url_list, dict):
+                    for key in ("main_url", "backup_url", "fallback_url"):
+                        _collect(url_list.get(key))
+
+                for key in ("main_url", "backup_url", "fallback_url", "url"):
+                    _append(source.get(key))
+                return
+
+            if isinstance(source, list):
+                for item in source:
+                    _collect(item)
+                return
+
+            _append(source)
+
+        for source in sources:
+            _collect(source)
+
+        return candidates
 
     @staticmethod
     def _infer_image_extension(image_url: str) -> str:
