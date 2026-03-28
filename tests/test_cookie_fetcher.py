@@ -6,6 +6,7 @@ from tools.cookie_fetcher import (
     extract_ms_token_from_text,
     filter_cookies,
     goto_with_fallback,
+    resolve_profile_dir,
     try_extract_ms_token,
     wait_for_login_confirmation,
 )
@@ -167,3 +168,30 @@ def test_filter_cookies_keeps_waf_and_fingerprint_keys_but_drops_unrelated_keys(
     assert cookies["s_v_web_id"] == "verify-id"
     assert cookies["__ac_signature"] == "ac-signature"
     assert "random_cookie" not in cookies
+
+
+def test_resolve_profile_dir_prefers_config_profile_dir(tmp_path):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text(
+        """
+like_cleanup:
+  persist_login: true
+  profile_dir: ./config/custom-like-profile
+""",
+        encoding="utf-8",
+    )
+
+    assert resolve_profile_dir(None, config_file) == tmp_path / "config" / "custom-like-profile"
+
+
+def test_resolve_profile_dir_can_disable_persistent_profile(tmp_path):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text(
+        """
+like_cleanup:
+  persist_login: false
+""",
+        encoding="utf-8",
+    )
+
+    assert resolve_profile_dir(None, config_file) is None

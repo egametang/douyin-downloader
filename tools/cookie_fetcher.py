@@ -12,6 +12,7 @@ from utils.cookie_utils import parse_cookie_header, sanitize_cookies
 
 DEFAULT_URL = "https://www.douyin.com/"
 DEFAULT_OUTPUT = Path("config/cookies.json")
+DEFAULT_PROFILE_DIR = Path("config/playwright-like-cleanup-profile")
 REQUIRED_KEYS = {"msToken", "ttwid", "odin_tt", "passport_csrf_token"}
 SUGGESTED_KEYS = REQUIRED_KEYS | {"sid_guard", "sessionid", "sid_tt"}
 DEFAULT_AUXILIARY_KEYS = {
@@ -68,6 +69,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Optional config.yml to update with captured cookies",
     )
     parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        help="Optional persistent Playwright profile dir to reuse login state",
+    )
+    parser.add_argument(
         "--include-all",
         action="store_true",
         help="Store every cookie from douyin.com instead of the recommended subset",
@@ -87,8 +93,17 @@ async def capture_cookies(args: argparse.Namespace) -> int:
 
     async with async_playwright() as p:
         browser_factory = getattr(p, args.browser)
-        browser = await browser_factory.launch(headless=args.headless)
-        context = await browser.new_context()
+        profile_dir = resolve_profile_dir(args.profile_dir, args.config)
+        browser = None
+        if profile_dir is not None:
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            context = await browser_factory.launch_persistent_context(
+                str(profile_dir),
+                headless=args.headless,
+            )
+        else:
+            browser = await browser_factory.launch(headless=args.headless)
+            context = await browser.new_context()
         page = await context.new_page()
         observed_cookie_headers: List[str] = []
         observed_mstokens: List[str] = []
@@ -137,7 +152,8 @@ async def capture_cookies(args: argparse.Namespace) -> int:
             print("[INFO] Extracted msToken from alternate sources.")
 
         await context.close()
-        await browser.close()
+        if browser is not None:
+            await browser.close()
 
     picked = cookies if args.include_all else filter_cookies(cookies)
     picked = sanitize_cookies(picked)
@@ -346,6 +362,42 @@ def filter_cookies(cookies: Dict[str, str]) -> Dict[str, str]:
     if not picked:
         return cookies
     return picked
+
+
+def resolve_profile_dir(
+    explicit_profile_dir: Optional[Path], config_path: Optional[Path]
+) -> Optional[Path]:
+    if explicit_profile_dir is not None:
+        return explicit_profile_dir
+    config_dir = config_path.resolve().parent if config_path and config_path.exists() else Path.cwd()
+    if config_path and config_path.exists():
+        try:
+            existing = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            existing = {}
+        like_cleanup = existing.get("like_cleanup")
+        if isinstance(like_cleanup, dict):
+            persist_login = like_cleanup.get("persist_login", True)
+            if isinstance(persist_login, str):
+                persist_login = persist_login.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            else:
+                persist_login = bool(persist_login)
+            if not persist_login:
+                return None
+            profile_dir = str(
+                like_cleanup.get("profile_dir", DEFAULT_PROFILE_DIR) or ""
+            ).strip()
+            if profile_dir:
+                resolved = Path(profile_dir)
+                if not resolved.is_absolute():
+                    resolved = config_dir / resolved
+                return resolved
+    return config_dir / DEFAULT_PROFILE_DIR
 
 
 def update_config(config_path: Path, cookies: Dict[str, str]) -> None:

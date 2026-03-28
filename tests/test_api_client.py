@@ -160,6 +160,234 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
     assert client.pop_browser_post_stats() == {}
 
 
+def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
+    class _FakePage:
+        def __init__(self):
+            self.context = None
+            self.evaluate_payloads = []
+            self.goto_calls = []
+            self.wait_calls = 0
+
+        async def goto(self, *args, **kwargs):
+            self.goto_calls.append((args, kwargs))
+            return
+
+        async def title(self):
+            return "抖音"
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _ms):
+            self.wait_calls += 1
+
+        async def evaluate(self, _script, payload):
+            self.evaluate_payloads.append(dict(payload))
+            aweme_id = payload.get("aweme_id")
+            if aweme_id == "111":
+                return {"http_status": 200, "status_code": 0, "status_msg": ""}
+            return {
+                "http_status": 200,
+                "status_code": 5,
+                "status_msg": "failed",
+            }
+
+    class _FakeContext:
+        def __init__(self, page):
+            self._page = page
+            self._page.context = self
+            self.added_cookies = []
+
+        async def add_cookies(self, cookies):
+            self.added_cookies.extend(cookies)
+
+        async def new_page(self):
+            return self._page
+
+        async def cookies(self, _base_url):
+            return [{"name": "sessionid", "value": "sess", "domain": ".douyin.com"}]
+
+        async def close(self):
+            return
+
+    class _FakeBrowser:
+        def __init__(self, context):
+            self._context = context
+
+        async def new_context(self, **_kwargs):
+            return self._context
+
+        async def close(self):
+            return
+
+    class _FakeChromium:
+        def __init__(self, browser):
+            self._browser = browser
+
+        async def launch(self, **_kwargs):
+            return self._browser
+
+    class _FakePlaywright:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+    class _FakePlaywrightManager:
+        def __init__(self, playwright):
+            self._playwright = playwright
+
+        async def __aenter__(self):
+            return self._playwright
+
+        async def __aexit__(self, *_args):
+            return
+
+    page = _FakePage()
+    context = _FakeContext(page)
+    browser = _FakeBrowser(context)
+    chromium = _FakeChromium(browser)
+    playwright = _FakePlaywright(chromium)
+    manager = _FakePlaywrightManager(playwright)
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: manager
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient(
+        {"msToken": "token-1", "sessionid": "sess", "sid_tt": "sid-tt"}
+    )
+    progress_events = []
+
+    result = asyncio.run(
+        client.cancel_likes_via_browser(
+            ["111", "222"],
+            headless=False,
+            wait_timeout_seconds=60,
+            request_interval_ms=10,
+            progress_callback=progress_events.append,
+        )
+    )
+
+    assert result["requested"] == 2
+    assert result["success_ids"] == ["111"]
+    assert result["failed_ids"] == ["222"]
+    assert any(cookie["name"] == "sessionid" for cookie in context.added_cookies)
+    assert any(cookie["name"] == "sid_tt" for cookie in context.added_cookies)
+    assert page.evaluate_payloads == [
+        {"aweme_id": "111", "type_value": 0},
+        {"aweme_id": "222", "type_value": 0},
+    ]
+    assert [event["status"] for event in progress_events] == ["success", "failed"]
+
+
+def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provided(
+    monkeypatch, tmp_path
+):
+    class _FakePage:
+        def __init__(self):
+            self.context = None
+            self.evaluate_payloads = []
+
+        async def goto(self, *args, **kwargs):
+            return
+
+        async def title(self):
+            return "抖音"
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _ms):
+            return
+
+        async def evaluate(self, _script, payload):
+            self.evaluate_payloads.append(dict(payload))
+            return {"http_status": 200, "status_code": 0, "status_msg": ""}
+
+    class _FakeContext:
+        def __init__(self, page):
+            self._page = page
+            self._page.context = self
+            self.added_cookies = []
+            self.pages = [page]
+            self.closed = False
+
+        async def add_cookies(self, cookies):
+            self.added_cookies.extend(cookies)
+
+        async def new_page(self):
+            return self._page
+
+        async def cookies(self, _base_url):
+            return [{"name": "sessionid", "value": "sess", "domain": ".douyin.com"}]
+
+        async def close(self):
+            self.closed = True
+
+    class _FakeChromium:
+        def __init__(self, context):
+            self._context = context
+            self.launch_calls = []
+            self.persistent_calls = []
+
+        async def launch(self, **kwargs):
+            self.launch_calls.append(dict(kwargs))
+            raise AssertionError("launch should not be used for persistent context")
+
+        async def launch_persistent_context(self, user_data_dir, **kwargs):
+            self.persistent_calls.append(
+                {"user_data_dir": user_data_dir, **dict(kwargs)}
+            )
+            return self._context
+
+    class _FakePlaywright:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+    class _FakePlaywrightManager:
+        def __init__(self, playwright):
+            self._playwright = playwright
+
+        async def __aenter__(self):
+            return self._playwright
+
+        async def __aexit__(self, *_args):
+            return
+
+    page = _FakePage()
+    context = _FakeContext(page)
+    chromium = _FakeChromium(context)
+    playwright = _FakePlaywright(chromium)
+    manager = _FakePlaywrightManager(playwright)
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: manager
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient(
+        {"msToken": "token-1", "sessionid": "sess", "sid_tt": "sid-tt"}
+    )
+    profile_dir = tmp_path / "profile"
+
+    result = asyncio.run(
+        client.cancel_likes_via_browser(
+            ["111"],
+            headless=False,
+            wait_timeout_seconds=60,
+            request_interval_ms=10,
+            profile_dir=str(profile_dir),
+        )
+    )
+
+    assert result["success_ids"] == ["111"]
+    assert chromium.persistent_calls[0]["user_data_dir"] == str(profile_dir)
+    assert profile_dir.exists() is True
+    assert page.evaluate_payloads == [{"aweme_id": "111", "type_value": 0}]
+
+
 @pytest.mark.asyncio
 async def test_get_user_post_returns_normalized_dto(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})

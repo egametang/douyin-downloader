@@ -36,6 +36,7 @@ class DownloadResult:
         self.success = 0
         self.failed = 0
         self.skipped = 0
+        self.success_aweme_ids: List[str] = []
 
     def __str__(self):
         return f"Total: {self.total}, Success: {self.success}, Failed: {self.failed}, Skipped: {self.skipped}"

@@ -99,6 +99,11 @@ def _build_downloader(
     progress_reporter=None,
     number_post: int = 0,
 ) -> UserDownloader:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     config_data = {
         "number": {"post": number_post},
         "increase": {"post": False},

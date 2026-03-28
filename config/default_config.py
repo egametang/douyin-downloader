@@ -52,4 +52,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "idle_rounds": 8,
         "wait_timeout_seconds": 600,
     },
+    "like_cleanup": {
+        "enabled": False,
+        "headless": False,
+        "persist_login": True,
+        "profile_dir": "./config/playwright-like-cleanup-profile",
+        "request_interval_ms": 1000,
+        "wait_timeout_seconds": 600,
+    },
 }

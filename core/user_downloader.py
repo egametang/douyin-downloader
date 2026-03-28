@@ -44,6 +44,7 @@ class UserDownloader(BaseDownloader):
         self._progress_update_step("下载模式", f"模式: {', '.join(modes)}")
 
         seen_aweme_ids: Set[str] = set()
+        like_cleanup_aweme_ids: List[str] = []
         for mode in modes:
             strategy = self._get_mode_strategy(mode)
             if strategy is None:
@@ -58,8 +59,86 @@ class UserDownloader(BaseDownloader):
             result.success += mode_result.success
             result.failed += mode_result.failed
             result.skipped += mode_result.skipped
+            if mode == "like" and mode_result.success_aweme_ids:
+                like_cleanup_aweme_ids.extend(mode_result.success_aweme_ids)
+
+        await self._cleanup_like_awemes(like_cleanup_aweme_ids)
 
         return result
+
+    @staticmethod
+    def _config_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    async def _cleanup_like_awemes(self, aweme_ids: List[str]) -> None:
+        cleanup_cfg = self.config.get("like_cleanup", {}) or {}
+        if not isinstance(cleanup_cfg, dict):
+            cleanup_cfg = {"enabled": cleanup_cfg}
+        if not self._config_bool(cleanup_cfg.get("enabled"), default=False):
+            return
+
+        normalized_ids: List[str] = []
+        seen: Set[str] = set()
+        for aweme_id in aweme_ids:
+            aweme_id_str = str(aweme_id or "").strip()
+            if not aweme_id_str or aweme_id_str in seen:
+                continue
+            seen.add(aweme_id_str)
+            normalized_ids.append(aweme_id_str)
+
+        if not normalized_ids:
+            return
+
+        self._progress_update_step("取消点赞", f"准备处理 {len(normalized_ids)} 条")
+        profile_dir = None
+        if self._config_bool(cleanup_cfg.get("persist_login"), default=True):
+            raw_profile_dir = str(
+                cleanup_cfg.get(
+                    "profile_dir", "./config/playwright-like-cleanup-profile"
+                )
+                or ""
+            ).strip()
+            if raw_profile_dir:
+                profile_dir = raw_profile_dir
+
+        try:
+            cleanup_result = await self.api_client.cancel_likes_via_browser(
+                normalized_ids,
+                headless=self._config_bool(
+                    cleanup_cfg.get("headless"), default=False
+                ),
+                wait_timeout_seconds=int(
+                    cleanup_cfg.get("wait_timeout_seconds", 600) or 600
+                ),
+                request_interval_ms=int(
+                    cleanup_cfg.get("request_interval_ms", 1000) or 1000
+                ),
+                profile_dir=profile_dir,
+            )
+        except Exception as exc:
+            logger.error("Like cleanup failed: %s", exc)
+            self._progress_update_step("取消点赞", f"执行失败: {exc}")
+            return
+
+        success_count = int(cleanup_result.get("success_count", 0) or 0)
+        failed_count = int(cleanup_result.get("failed_count", 0) or 0)
+        self._progress_update_step(
+            "取消点赞", f"成功 {success_count} / 失败 {failed_count}"
+        )
+        if failed_count:
+            logger.warning(
+                "Like cleanup finished with failures: success=%s, failed=%s",
+                success_count,
+                failed_count,
+            )
+        else:
+            logger.warning("Like cleanup finished: success=%s", success_count)
 
     def _validate_mode_scope(self, sec_uid: str, modes: List[str]) -> bool:
         normalized_modes = {str(mode or "").strip() for mode in modes}
@@ -155,6 +234,9 @@ class UserDownloader(BaseDownloader):
             status = entry.get("status") if isinstance(entry, dict) else None
             if status == "success":
                 result.success += 1
+                aweme_id = str(entry.get("aweme_id") or "").strip()
+                if aweme_id:
+                    result.success_aweme_ids.append(aweme_id)
             elif status == "failed":
                 result.failed += 1
             elif status == "skipped":

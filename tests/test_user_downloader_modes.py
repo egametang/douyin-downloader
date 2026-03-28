@@ -38,6 +38,8 @@ class _FakeAPIClient:
         self.user_info_calls = []
         self.collect_calls = 0
         self.collect_mix_calls = 0
+        self.cancel_like_calls = []
+        self.cancel_like_kwargs = []
 
     async def get_user_info(self, _sec_uid: str):
         self.user_info_calls.append(_sec_uid)
@@ -101,14 +103,40 @@ class _FakeAPIClient:
             "status_code": 0,
         }
 
+    async def cancel_likes_via_browser(self, aweme_ids, **kwargs):
+        self.cancel_like_calls.append(list(aweme_ids))
+        self.cancel_like_kwargs.append(dict(kwargs))
+        return {
+            "requested": len(aweme_ids),
+            "success_ids": list(aweme_ids),
+            "failed_ids": [],
+            "success_count": len(aweme_ids),
+            "failed_count": 0,
+        }
 
-def _build_downloader(tmp_path, mode: List[str]) -> UserDownloader:
+
+def _build_downloader(
+    tmp_path, mode: List[str], like_cleanup_enabled: bool = False
+) -> UserDownloader:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     config_data = {
         "number": {"post": 0, "like": 0, "mix": 0, "music": 0},
         "increase": {"post": False, "like": False, "mix": False, "music": False},
         "mode": mode,
         "thread": 2,
         "browser_fallback": {"enabled": False},
+        "like_cleanup": {
+            "enabled": like_cleanup_enabled,
+            "headless": False,
+            "persist_login": True,
+            "profile_dir": "./config/playwright-like-cleanup-profile",
+            "request_interval_ms": 1000,
+            "wait_timeout_seconds": 90,
+        },
     }
     config = _FakeConfig(config_data)
     file_manager = FileManager(str(tmp_path / "Downloaded"))
@@ -225,3 +253,35 @@ def test_user_downloader_rejects_mixed_self_collect_and_regular_modes(
     assert result.success == 0
     assert downloader.api_client.user_info_calls == []
     assert downloader.api_client.collect_calls == 0
+
+
+def test_user_downloader_cleans_up_successful_like_items_when_enabled(
+    tmp_path, monkeypatch
+):
+    downloader = _build_downloader(
+        tmp_path, mode=["like"], like_cleanup_enabled=True
+    )
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    async def _download_partial(item, *_args, **_kwargs):
+        return item.get("aweme_id") == "222"
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _download_partial)
+
+    result = asyncio.run(downloader.download({"sec_uid": "sec_uid_x"}))
+
+    assert result.total == 2
+    assert result.success == 1
+    assert result.failed == 1
+    assert downloader.api_client.cancel_like_calls == [["222"]]
+    assert downloader.api_client.cancel_like_kwargs == [
+        {
+            "headless": False,
+            "profile_dir": "./config/playwright-like-cleanup-profile",
+            "wait_timeout_seconds": 90,
+            "request_interval_ms": 1000,
+        }
+    ]

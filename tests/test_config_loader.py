@@ -186,7 +186,9 @@ auto_cookie: false
     assert loader.get_cookies() == {}
 
 
-def test_config_loader_warns_for_non_object_auto_cookie_file(tmp_path, caplog):
+def test_config_loader_warns_for_non_object_auto_cookie_file(
+    tmp_path, caplog, monkeypatch
+):
     config_file = tmp_path / "config.yml"
     config_file.write_text(
         """
@@ -199,6 +201,7 @@ cookies: auto
     cookie_dir = tmp_path / "config"
     cookie_dir.mkdir()
     (cookie_dir / "cookies.json").write_text("[]", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
 
     loader = ConfigLoader(str(config_file))
     cookies = loader.get_cookies()
@@ -224,6 +227,27 @@ path: ./Downloaded/
 
     assert isinstance(progress, dict)
     assert progress.get("quiet_logs") is True
+
+
+def test_like_cleanup_defaults_disabled(tmp_path):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text(
+        """
+link:
+  - https://www.douyin.com/video/1
+path: ./Downloaded/
+"""
+    )
+
+    loader = ConfigLoader(str(config_file))
+    like_cleanup = loader.get("like_cleanup", {})
+
+    assert isinstance(like_cleanup, dict)
+    assert like_cleanup.get("enabled") is False
+    assert like_cleanup.get("headless") is False
+    assert like_cleanup.get("persist_login") is True
+    assert like_cleanup.get("profile_dir") == "./config/playwright-like-cleanup-profile"
+    assert like_cleanup.get("request_interval_ms") == 1000
 
 
 def test_progress_quiet_logs_can_be_overridden(tmp_path):

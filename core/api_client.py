@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -577,6 +578,16 @@ class DouyinAPIClient:
                 except Exception:
                     pass
                 if "验证码" in title:
+                    if callable(progress_callback):
+                        try:
+                            progress_callback(
+                                {
+                                    "event": "verification_required",
+                                    "message": "verification_required",
+                                }
+                            )
+                        except Exception as exc:
+                            logger.debug("Like cleanup progress callback failed: %s", exc)
                     if headless:
                         logger.warning(
                             "检测到验证码页面且当前为 headless 模式，无法人工验证。"
@@ -675,6 +686,243 @@ class DouyinAPIClient:
         )
         return selected_ids
 
+    async def cancel_likes_via_browser(
+        self,
+        aweme_ids: List[str],
+        *,
+        headless: bool = False,
+        wait_timeout_seconds: int = 600,
+        request_interval_ms: int = 1000,
+        profile_dir: Optional[str] = None,
+        progress_callback=None,
+        login_confirmation_callback=None,
+    ) -> Dict[str, Any]:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning(
+                "Playwright not available, like cleanup disabled: %s", exc
+            )
+            normalized_ids = self._normalize_aweme_ids(aweme_ids)
+            return {
+                "requested": len(normalized_ids),
+                "success_ids": [],
+                "failed_ids": normalized_ids,
+                "success_count": 0,
+                "failed_count": len(normalized_ids),
+            }
+
+        normalized_ids = self._normalize_aweme_ids(aweme_ids)
+        result = {
+            "requested": len(normalized_ids),
+            "success_ids": [],
+            "failed_ids": [],
+            "success_count": 0,
+            "failed_count": 0,
+        }
+        if not normalized_ids:
+            return result
+
+        target_url = f"{self.BASE_URL}/user/self?showTab=like"
+        timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
+
+        logger.warning(
+            "启动浏览器取消点赞：count=%s, headless=%s",
+            len(normalized_ids),
+            headless,
+        )
+
+        async with async_playwright() as playwright:
+            context, browser = await self._create_browser_context(
+                playwright,
+                headless=headless,
+                include_sensitive_cookies=True,
+                profile_dir=profile_dir,
+            )
+            pages = getattr(context, "pages", None)
+            page = pages[0] if isinstance(pages, list) and pages else await context.new_page()
+            try:
+                try:
+                    await page.goto(
+                        target_url, wait_until="domcontentloaded", timeout=timeout_ms
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Browser goto timeout or error before like cleanup: %s", exc
+                    )
+
+                title = ""
+                try:
+                    title = await page.title()
+                except Exception:
+                    pass
+                if "验证码" in title:
+                    if headless:
+                        logger.warning(
+                            "检测到验证码页面且当前为 headless 模式，无法人工验证。"
+                            "请将 like_cleanup.headless 设为 false。"
+                        )
+                        result["failed_ids"] = normalized_ids
+                        return self._finalize_like_cleanup_result(result)
+                    logger.warning(
+                        "检测到验证码页面，请在浏览器中完成验证，程序会自动继续取消点赞。"
+                    )
+                    await self._wait_for_manual_verification(
+                        page, wait_timeout_seconds=wait_timeout_seconds
+                    )
+                    if not page.is_closed():
+                        try:
+                            await page.goto(
+                                target_url,
+                                wait_until="domcontentloaded",
+                                timeout=timeout_ms,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Reload like page after verification failed: %s", exc
+                            )
+
+                if not headless and not await self._page_has_login_cookies(page):
+                    if callable(progress_callback):
+                        try:
+                            progress_callback(
+                                {
+                                    "event": "login_state_missing",
+                                    "message": "login_state_missing",
+                                }
+                            )
+                        except Exception as exc:
+                            logger.debug("Like cleanup progress callback failed: %s", exc)
+                    logger.warning(
+                        "未检测到完整登录态，如浏览器弹出登录页，请先完成登录后程序会继续。"
+                    )
+                    if callable(login_confirmation_callback):
+                        try:
+                            maybe_awaitable = login_confirmation_callback(
+                                "请在弹出的浏览器中完成抖音登录，然后回到终端按 Enter 继续。"
+                            )
+                            if asyncio.iscoroutine(maybe_awaitable):
+                                await maybe_awaitable
+                        except Exception as exc:
+                            logger.debug(
+                                "Like cleanup login confirmation callback failed: %s",
+                                exc,
+                            )
+
+                for index, aweme_id in enumerate(normalized_ids, start=1):
+                    if page.is_closed():
+                        logger.warning("Browser page closed during like cleanup")
+                        result["failed_ids"].extend(normalized_ids[index - 1 :])
+                        break
+
+                    response = await self._commit_digg_via_page(
+                        page, aweme_id, type_value=0
+                    )
+                    status_code = self._as_int(response.get("status_code"), default=-1)
+                    if status_code == 8 and not headless:
+                        if callable(progress_callback):
+                            try:
+                                progress_callback(
+                                    {
+                                        "event": "login_required",
+                                        "aweme_id": aweme_id,
+                                        "message": "login_required",
+                                    }
+                                )
+                            except Exception as exc:
+                                logger.debug("Like cleanup progress callback failed: %s", exc)
+                        logger.warning(
+                            "取消点赞返回未登录，请在浏览器中完成登录，程序会自动重试。"
+                        )
+                        if callable(login_confirmation_callback):
+                            try:
+                                maybe_awaitable = login_confirmation_callback(
+                                    f"作品 {aweme_id} 取消点赞返回未登录。请先在浏览器完成登录，然后回到终端按 Enter 继续。"
+                                )
+                                if asyncio.iscoroutine(maybe_awaitable):
+                                    await maybe_awaitable
+                            except Exception as exc:
+                                logger.debug(
+                                    "Like cleanup login confirmation callback failed: %s",
+                                    exc,
+                                )
+                        else:
+                            await self._wait_for_manual_login(
+                                page, wait_timeout_seconds=wait_timeout_seconds
+                            )
+                        if not page.is_closed():
+                            try:
+                                await page.goto(
+                                    target_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=timeout_ms,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Reload like page after manual login failed: %s",
+                                    exc,
+                                )
+                            response = await self._commit_digg_via_page(
+                                page, aweme_id, type_value=0
+                            )
+                            status_code = self._as_int(
+                                response.get("status_code"), default=-1
+                            )
+
+                    if status_code == 0:
+                        result["success_ids"].append(aweme_id)
+                        progress_status = "success"
+                    else:
+                        result["failed_ids"].append(aweme_id)
+                        progress_status = "failed"
+                        logger.warning(
+                            "取消点赞失败 aweme_id=%s, status_code=%s, status_msg=%s, http_status=%s",
+                            aweme_id,
+                            status_code,
+                            response.get("status_msg") or "",
+                            response.get("http_status"),
+                        )
+
+                    if callable(progress_callback):
+                        try:
+                            progress_callback(
+                                {
+                                    "index": index,
+                                    "total": len(normalized_ids),
+                                    "aweme_id": aweme_id,
+                                    "status": progress_status,
+                                    "status_code": status_code,
+                                    "status_msg": response.get("status_msg") or "",
+                                }
+                            )
+                        except Exception as exc:
+                            logger.debug("Like cleanup progress callback failed: %s", exc)
+
+                    if (
+                        index < len(normalized_ids)
+                        and int(request_interval_ms or 0) > 0
+                    ):
+                        try:
+                            await page.wait_for_timeout(int(request_interval_ms))
+                        except Exception as exc:
+                            logger.warning(
+                                "Like cleanup interrupted while waiting next request: %s",
+                                exc,
+                            )
+                            result["failed_ids"].extend(normalized_ids[index:])
+                            break
+            finally:
+                try:
+                    browser_cookies = await context.cookies(self.BASE_URL)
+                    self._sync_browser_cookies(browser_cookies)
+                except Exception as exc:
+                    logger.debug("Sync browser cookies skipped: %s", exc)
+                await context.close()
+                if browser is not None:
+                    await browser.close()
+
+        return self._finalize_like_cleanup_result(result)
+
     def pop_browser_post_aweme_items(self) -> Dict[str, Dict[str, Any]]:
         items = self._browser_post_aweme_items
         self._browser_post_aweme_items = {}
@@ -685,12 +933,14 @@ class DouyinAPIClient:
         self._browser_post_stats = {}
         return stats
 
-    def _browser_cookie_payload(self) -> List[Dict[str, str]]:
+    def _browser_cookie_payload(
+        self, *, include_sensitive: bool = False
+    ) -> List[Dict[str, str]]:
         payload: List[Dict[str, str]] = []
         for name, value in self.cookies.items():
             if not name:
                 continue
-            if name in self._BROWSER_COOKIE_BLOCKLIST:
+            if not include_sensitive and name in self._BROWSER_COOKIE_BLOCKLIST:
                 continue
             payload.append(
                 {
@@ -700,6 +950,54 @@ class DouyinAPIClient:
                 }
             )
         return payload
+
+    async def _create_browser_context(
+        self,
+        playwright,
+        *,
+        headless: bool,
+        include_sensitive_cookies: bool,
+        profile_dir: Optional[str] = None,
+    ):
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+        ]
+        context_kwargs = {
+            "user_agent": self.headers.get("User-Agent", ""),
+            "locale": "zh-CN",
+            "viewport": {"width": 1600, "height": 900},
+        }
+
+        browser = None
+        normalized_profile_dir = str(profile_dir or "").strip()
+        if normalized_profile_dir:
+            profile_path = Path(normalized_profile_dir).expanduser()
+            profile_path.mkdir(parents=True, exist_ok=True)
+            context = await playwright.chromium.launch_persistent_context(
+                str(profile_path),
+                headless=headless,
+                args=launch_args,
+                **context_kwargs,
+            )
+        else:
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                args=launch_args,
+            )
+            context = await browser.new_context(**context_kwargs)
+
+        cookies = self._browser_cookie_payload(
+            include_sensitive=include_sensitive_cookies
+        )
+        if cookies:
+            try:
+                await context.add_cookies(cookies)
+            except Exception as exc:
+                logger.debug("Seed browser cookies skipped: %s", exc)
+
+        return context, browser
 
     async def _extract_aweme_ids_from_page(self, page) -> List[str]:
         script = """
@@ -765,6 +1063,179 @@ class DouyinAPIClient:
         logger.warning(
             "等待手动验证超时（%ss），继续按当前页面状态采集。", wait_timeout_seconds
         )
+
+    async def _wait_for_manual_login(
+        self, page, *, wait_timeout_seconds: int
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + max(
+            30, int(wait_timeout_seconds)
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed():
+                logger.warning("Browser page closed while waiting manual login")
+                return
+            if await self._page_has_login_cookies(page):
+                logger.warning("检测到浏览器登录态，继续执行取消点赞。")
+                return
+            await page.wait_for_timeout(1000)
+
+        logger.warning(
+            "等待手动登录超时（%ss），继续按当前页面状态尝试取消点赞。",
+            wait_timeout_seconds,
+        )
+
+    async def _page_has_login_cookies(self, page) -> bool:
+        context = getattr(page, "context", None)
+        if context is None:
+            return False
+
+        try:
+            cookies = await context.cookies(self.BASE_URL)
+        except Exception:
+            return False
+
+        names = {
+            str(cookie.get("name") or "").strip()
+            for cookie in cookies or []
+            if isinstance(cookie, dict)
+        }
+        return bool(
+            names
+            & {
+                "sessionid",
+                "sessionid_ss",
+                "sid_tt",
+                "sid_guard",
+                "uid_tt",
+                "uid_tt_ss",
+            }
+        )
+
+    async def _commit_digg_via_page(
+        self, page, aweme_id: str, *, type_value: int
+    ) -> Dict[str, Any]:
+        script = """
+async ({ aweme_id, type_value }) => {
+  const getCookie = (name) => {
+    const prefix = `${name}=`;
+    const parts = document.cookie ? document.cookie.split("; ") : [];
+    for (const part of parts) {
+      if (part.startsWith(prefix)) {
+        return decodeURIComponent(part.slice(prefix.length));
+      }
+    }
+    return "";
+  };
+
+  const decodeGuardKey = () => {
+    const raw = getCookie("bd_ticket_guard_client_data_v2");
+    if (!raw) return "";
+    try {
+      const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+      const padding = "=".repeat((4 - (normalized.length % 4)) % 4);
+      const decoded = atob(normalized + padding);
+      const parsed = JSON.parse(decoded);
+      return parsed && typeof parsed.ree_public_key === "string"
+        ? parsed.ree_public_key
+        : "";
+    } catch (_err) {
+      return "";
+    }
+  };
+
+  const csrfToken =
+    getCookie("passport_csrf_token") ||
+    getCookie("passport_csrf_token_default") ||
+    "";
+  const headers = {
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "x-secsdk-csrf-request": "1",
+    "x-requested-with": "XMLHttpRequest",
+  };
+  if (csrfToken) {
+    headers["x-secsdk-csrf-token"] = csrfToken;
+    headers["x-tt-passport-csrf-token"] = csrfToken;
+  }
+  const reePublicKey = decodeGuardKey();
+  if (reePublicKey) {
+    headers["bd-ticket-guard-ree-public-key"] = reePublicKey;
+  }
+
+  const body = new URLSearchParams({
+    aweme_id: String(aweme_id || ""),
+    item_type: "0",
+    type: String(type_value || 0),
+  });
+
+  try {
+    const response = await fetch("/aweme/v1/web/commit/item/digg/?aid=6383", {
+      method: "POST",
+      credentials: "include",
+      headers,
+      body: body.toString(),
+    });
+    const text = await response.text();
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch (_err) {
+      data = {};
+    }
+    return {
+      http_status: response.status,
+      status_code: typeof data.status_code === "number" ? data.status_code : data.status_code ?? null,
+      status_msg: data.status_msg || "",
+      body: text.slice(0, 500),
+    };
+  } catch (error) {
+    return {
+      http_status: 0,
+      status_code: null,
+      status_msg: error && error.message ? error.message : "fetch_failed",
+      body: "",
+    };
+  }
+}
+"""
+        try:
+            data = await page.evaluate(
+                script,
+                {"aweme_id": str(aweme_id or ""), "type_value": int(type_value)},
+            )
+        except Exception as exc:
+            return {
+                "http_status": 0,
+                "status_code": None,
+                "status_msg": str(exc),
+                "body": "",
+            }
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _normalize_aweme_ids(aweme_ids: List[str]) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for aweme_id in aweme_ids or []:
+            aweme_id_str = str(aweme_id or "").strip()
+            if not aweme_id_str or aweme_id_str in seen:
+                continue
+            seen.add(aweme_id_str)
+            normalized.append(aweme_id_str)
+        return normalized
+
+    @staticmethod
+    def _as_int(value: Any, *, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _finalize_like_cleanup_result(result: Dict[str, Any]) -> Dict[str, Any]:
+        result["success_count"] = len(result.get("success_ids") or [])
+        result["failed_count"] = len(result.get("failed_ids") or [])
+        return result
 
     def _sync_browser_cookies(self, browser_cookies: List[Dict[str, Any]]) -> None:
         merged: Dict[str, str] = {}
