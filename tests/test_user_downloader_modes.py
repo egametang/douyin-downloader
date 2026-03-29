@@ -277,11 +277,10 @@ def test_user_downloader_cleans_up_successful_like_items_when_enabled(
     assert result.success == 1
     assert result.failed == 1
     assert downloader.api_client.cancel_like_calls == [["222"]]
-    assert downloader.api_client.cancel_like_kwargs == [
-        {
-            "headless": False,
-            "profile_dir": "./config/playwright-like-cleanup-profile",
-            "wait_timeout_seconds": 90,
-            "request_interval_ms": 1000,
-        }
-    ]
+    assert len(downloader.api_client.cancel_like_kwargs) == 1
+    kwargs = downloader.api_client.cancel_like_kwargs[0]
+    assert kwargs["headless"] is False
+    assert kwargs["profile_dir"] == "./config/playwright-like-cleanup-profile"
+    assert kwargs["wait_timeout_seconds"] == 90
+    assert kwargs["request_interval_ms"] == 1000
+    assert callable(kwargs["login_confirmation_callback"])

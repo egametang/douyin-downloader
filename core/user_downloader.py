@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional, Set
 
 from core.downloader_base import BaseDownloader, DownloadResult
@@ -120,6 +121,7 @@ class UserDownloader(BaseDownloader):
                     cleanup_cfg.get("request_interval_ms", 1000) or 1000
                 ),
                 profile_dir=profile_dir,
+                login_confirmation_callback=self._wait_for_like_cleanup_login_confirmation,
             )
         except Exception as exc:
             logger.error("Like cleanup failed: %s", exc)
@@ -139,6 +141,19 @@ class UserDownloader(BaseDownloader):
             )
         else:
             logger.warning("Like cleanup finished: success=%s", success_count)
+
+    async def _wait_for_like_cleanup_login_confirmation(self, message: str) -> None:
+        prompt = (
+            str(message or "").strip()
+            or "请在浏览器中完成抖音登录，然后回到终端按 Enter 继续。"
+        )
+        logger.warning(prompt)
+        self._progress_update_step("取消点赞", "等待人工确认登录")
+        try:
+            await asyncio.to_thread(input)
+        except EOFError:
+            logger.warning("Terminal input unavailable while waiting manual login confirmation")
+        self._progress_update_step("取消点赞", "已收到人工确认，继续执行")
 
     def _validate_mode_scope(self, sec_uid: str, modes: List[str]) -> bool:
         normalized_modes = {str(mode or "").strip() for mode in modes}
