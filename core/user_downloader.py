@@ -450,6 +450,21 @@ class UserDownloader(BaseDownloader):
             logger.error("Like browser fallback failed: %s", exc)
             return
 
+        browser_aweme_items: Dict[str, Dict[str, Any]] = {}
+        browser_like_stats: Dict[str, int] = {}
+        if hasattr(self.api_client, "pop_browser_like_aweme_items"):
+            try:
+                browser_aweme_items = (
+                    self.api_client.pop_browser_like_aweme_items() or {}
+                )
+            except Exception as exc:
+                logger.debug("Fetch browser like items skipped: %s", exc)
+        if hasattr(self.api_client, "pop_browser_like_stats"):
+            try:
+                browser_like_stats = self.api_client.pop_browser_like_stats() or {}
+            except Exception as exc:
+                logger.debug("Fetch browser like stats skipped: %s", exc)
+
         if not browser_aweme_ids:
             logger.warning("Like browser fallback returned no aweme_id")
             return
@@ -469,6 +484,7 @@ class UserDownloader(BaseDownloader):
         )
         detail_failed = 0
         detail_success = 0
+        reused_from_browser_items = 0
         total_missing = len(missing_ids)
         for index, aweme_id in enumerate(missing_ids, start=1):
             if number_limit > 0 and len(aweme_list) >= number_limit:
@@ -479,23 +495,31 @@ class UserDownloader(BaseDownloader):
                     "浏览器回补", f"补全喜欢详情 {index}/{total_missing}"
                 )
 
-            await self.rate_limiter.acquire()
-            detail = await self.api_client.get_video_detail(
-                aweme_id, suppress_error=True
-            )
+            detail = browser_aweme_items.get(str(aweme_id))
+            if not detail:
+                await self.rate_limiter.acquire()
+                detail = await self.api_client.get_video_detail(
+                    aweme_id, suppress_error=True
+                )
+                if detail:
+                    detail_success += 1
+            else:
+                reused_from_browser_items += 1
             if not detail:
                 detail_failed += 1
                 continue
-            detail_success += 1
             aweme_list.append(detail)
 
         self._progress_update_step(
             "浏览器回补",
-            f"喜欢回补完成，补拉成功 {detail_success}，失败 {detail_failed}",
+            f"喜欢回补完成，复用 {reused_from_browser_items}，补拉成功 {detail_success}，失败 {detail_failed}",
         )
         logger.warning(
-            "Like browser fallback summary: merged_ids=%s detail_success=%s detail_failed=%s",
-            len(browser_aweme_ids),
+            "Like browser fallback summary: selected_ids=%s like_items=%s like_pages=%s reused=%s detail_success=%s detail_failed=%s",
+            browser_like_stats.get("selected_ids", len(browser_aweme_ids)),
+            browser_like_stats.get("like_items", len(browser_aweme_items)),
+            browser_like_stats.get("like_pages", 0),
+            reused_from_browser_items,
             detail_success,
             detail_failed,
         )

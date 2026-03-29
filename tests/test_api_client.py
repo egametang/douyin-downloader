@@ -226,6 +226,124 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
     assert client.pop_browser_post_stats() == {}
 
 
+def test_collect_user_like_ids_via_browser_uses_favorite_api_payload(monkeypatch):
+    class _FakeMouse:
+        async def wheel(self, _x, _y):
+            return
+
+    class _FakeLocator:
+        def __init__(self):
+            self.first = self
+
+        async def count(self):
+            return 1
+
+        async def evaluate(self, _script):
+            return None
+
+    class _FakePage:
+        def __init__(self):
+            self.mouse = _FakeMouse()
+            self._response_handler = None
+
+        def on(self, event_name, callback):
+            if event_name == "response":
+                self._response_handler = callback
+
+        async def goto(self, *_args, **_kwargs):
+            if self._response_handler is not None:
+                self._response_handler(_FakeResponse())
+            return
+
+        async def title(self):
+            return "抖音"
+
+        def is_closed(self):
+            return False
+
+        def locator(self, _selector):
+            return _FakeLocator()
+
+        async def wait_for_timeout(self, _ms):
+            return
+
+    class _FakeContext:
+        def __init__(self, page):
+            self._page = page
+            self.pages = []
+
+        async def new_page(self):
+            return self._page
+
+        async def cookies(self, _base_url):
+            return []
+
+        async def close(self):
+            return
+
+    class _FakeBrowser:
+        async def close(self):
+            return
+
+    class _FakeResponse:
+        url = "https://www.douyin.com/aweme/v1/web/aweme/favorite/?cursor=0"
+        status = 200
+        headers = {"content-type": "application/json"}
+
+        async def json(self):
+            return {
+                "status_code": 0,
+                "aweme_list": [
+                    {"aweme_id": "111", "desc": "like-111"},
+                    {"aweme_id": "222", "desc": "like-222"},
+                ],
+            }
+
+    class _FakePlaywrightManager:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: _FakePlaywrightManager()
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    page = _FakePage()
+    context = _FakeContext(page)
+    browser = _FakeBrowser()
+
+    async def _fake_create_browser_context(*_args, **_kwargs):
+        return context, browser
+
+    monkeypatch.setattr(client, "_create_browser_context", _fake_create_browser_context)
+
+    ids = asyncio.run(
+        client.collect_user_like_ids_via_browser(
+            "sec_uid_x",
+            headless=True,
+            max_scrolls=1,
+            idle_rounds=1,
+            wait_timeout_seconds=30,
+        )
+    )
+
+    assert ids == ["111", "222"]
+    assert client.pop_browser_like_aweme_items() == {
+        "111": {"aweme_id": "111", "desc": "like-111"},
+        "222": {"aweme_id": "222", "desc": "like-222"},
+    }
+    assert client.pop_browser_like_stats() == {
+        "selected_ids": 2,
+        "like_items": 2,
+        "like_pages": 1,
+    }
+
+
 def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
     class _FakePage:
         def __init__(self):

@@ -29,6 +29,11 @@ class _FakeProgressReporter:
 
 
 def _build_downloader(tmp_path):
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     config = ConfigLoader()
     config.update(path=str(tmp_path))
 
@@ -351,10 +356,19 @@ async def test_download_aweme_assets_uses_publish_date_and_writes_manifest(
 
     saved_paths = []
 
+    async def _fake_download_from_url_candidates(
+        self, _urls, save_path, _session, **_kwargs
+    ):
+        saved_paths.append(save_path)
+        return True
+
     async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
         saved_paths.append(save_path)
         return True
 
+    downloader._download_from_url_candidates = (
+        _fake_download_from_url_candidates.__get__(downloader, VideoDownloader)
+    )
     downloader._download_with_retry = _fake_download_with_retry.__get__(
         downloader, VideoDownloader
     )
@@ -464,10 +478,19 @@ async def test_download_aweme_assets_video_writes_cover_avatar_and_json(
 
     saved_paths = []
 
+    async def _fake_download_from_url_candidates(
+        self, _urls, save_path, _session, **_kwargs
+    ):
+        saved_paths.append(save_path)
+        return True
+
     async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
         saved_paths.append(save_path)
         return True
 
+    downloader._download_from_url_candidates = (
+        _fake_download_from_url_candidates.__get__(downloader, VideoDownloader)
+    )
     downloader._download_with_retry = _fake_download_with_retry.__get__(
         downloader, VideoDownloader
     )
@@ -837,10 +860,19 @@ async def test_download_aweme_assets_gallery_downloads_live_photo_videos(
 
     saved_paths = []
 
+    async def _fake_download_from_url_candidates(
+        self, _urls, save_path, _session, **_kwargs
+    ):
+        saved_paths.append(save_path)
+        return True
+
     async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
         saved_paths.append(save_path)
         return True
 
+    downloader._download_from_url_candidates = (
+        _fake_download_from_url_candidates.__get__(downloader, VideoDownloader)
+    )
     downloader._download_with_retry = _fake_download_with_retry.__get__(
         downloader, VideoDownloader
     )
@@ -894,10 +926,19 @@ async def test_download_aweme_assets_gallery_preserves_real_image_extensions(
 
     saved_paths = []
 
+    async def _fake_download_from_url_candidates(
+        self, _urls, save_path, _session, **_kwargs
+    ):
+        saved_paths.append(save_path)
+        return True
+
     async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
         saved_paths.append(save_path)
         return True
 
+    downloader._download_from_url_candidates = (
+        _fake_download_from_url_candidates.__get__(downloader, VideoDownloader)
+    )
     downloader._download_with_retry = _fake_download_with_retry.__get__(
         downloader, VideoDownloader
     )
@@ -936,6 +977,67 @@ async def test_download_aweme_assets_gallery_preserves_real_image_extensions(
 
     assert success is True
     assert [path.suffix for path in saved_paths] == [".png", ".jpeg", ".jpg"]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_download_aweme_assets_gallery_tries_next_image_candidate(
+    tmp_path, monkeypatch
+):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False, cover=False, avatar=False, json=False, folderstyle=True
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    attempted_urls = []
+
+    async def _fake_download_file(
+        url,
+        save_path,
+        _session=None,
+        headers=None,
+        proxy=None,
+        **_kwargs,
+    ):
+        attempted_urls.append(url)
+        if url.endswith("primary.webp"):
+            return False
+        return save_path
+
+    monkeypatch.setattr(downloader.file_manager, "download_file", _fake_download_file)
+
+    aweme_data = {
+        "aweme_id": "7600224486650121995",
+        "desc": "图库候选回退",
+        "image_post_info": {
+            "images": [
+                {
+                    "download_url": {
+                        "url_list": ["https://example.com/primary.webp"]
+                    },
+                    "display_image": {
+                        "url_list": ["https://example.com/fallback.jpeg"]
+                    },
+                }
+            ]
+        },
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    assert success is True
+    assert attempted_urls == [
+        "https://example.com/primary.webp",
+        "https://example.com/fallback.jpeg",
+    ]
 
     await api_client.close()
 
@@ -1005,6 +1107,72 @@ async def test_download_aweme_assets_gallery_uses_response_content_type_for_suff
     lines = manifest_path.read_text(encoding="utf-8").strip().splitlines()
     manifest_entry = json.loads(lines[-1])
     assert manifest_entry["file_names"] == saved_files
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_download_aweme_assets_gallery_cleans_partial_files_on_failure(
+    tmp_path, monkeypatch
+):
+    downloader, api_client = _build_downloader(tmp_path)
+    downloader.config.update(
+        music=False, cover=False, avatar=False, json=False, folderstyle=True
+    )
+
+    async def _fake_get_session():
+        return object()
+
+    monkeypatch.setattr(api_client, "get_session", _fake_get_session)
+
+    publish_ts = 1707303025
+    publish_date = datetime.fromtimestamp(publish_ts).strftime("%Y-%m-%d")
+    aweme_id = "7600224486650121996"
+
+    async def _fake_download_file(
+        url,
+        save_path,
+        _session=None,
+        headers=None,
+        proxy=None,
+        **_kwargs,
+    ):
+        if url.endswith("ok.webp"):
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(b"ok")
+            return save_path
+        return False
+
+    monkeypatch.setattr(downloader.file_manager, "download_file", _fake_download_file)
+
+    aweme_data = {
+        "aweme_id": aweme_id,
+        "desc": "图库失败清理",
+        "create_time": publish_ts,
+        "image_post_info": {
+            "images": [
+                {
+                    "display_image": {
+                        "url_list": ["https://example.com/ok.webp"]
+                    }
+                },
+                {
+                    "display_image": {
+                        "url_list": ["https://example.com/fail.webp"]
+                    }
+                },
+            ]
+        },
+    }
+
+    success = await downloader._download_aweme_assets(
+        aweme_data, author_name="测试作者", mode="post"
+    )
+
+    save_dir = tmp_path / "测试作者" / "post" / f"{publish_date}_图库失败清理_{aweme_id}"
+
+    assert success is False
+    assert not save_dir.exists()
 
     await api_client.close()
 
@@ -1085,12 +1253,21 @@ async def test_download_aweme_assets_gallery_fails_when_live_video_download_fail
 
     saved_paths = []
 
+    async def _fake_download_from_url_candidates(
+        self, _urls, save_path, _session, **_kwargs
+    ):
+        saved_paths.append(save_path)
+        return True
+
     async def _fake_download_with_retry(self, _url, save_path, _session, **_kwargs):
         saved_paths.append(save_path)
         if save_path.name.endswith("_live_2.mp4"):
             return False
         return True
 
+    downloader._download_from_url_candidates = (
+        _fake_download_from_url_candidates.__get__(downloader, VideoDownloader)
+    )
     downloader._download_with_retry = _fake_download_with_retry.__get__(
         downloader, VideoDownloader
     )

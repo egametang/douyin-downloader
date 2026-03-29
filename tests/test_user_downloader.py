@@ -60,6 +60,8 @@ class _FakeAPIClient:
         self.like_browser_call_kwargs: List[Dict[str, Any]] = []
         self.browser_post_items: Dict[str, Dict[str, Any]] = {}
         self.browser_post_stats: Dict[str, int] = {}
+        self.browser_like_items: Dict[str, Dict[str, Any]] = {}
+        self.browser_like_stats: Dict[str, int] = {}
 
     async def get_user_post(self, _sec_uid: str, max_cursor: int = 0, _count: int = 20):
         self.user_post_calls.append(max_cursor)
@@ -96,6 +98,16 @@ class _FakeAPIClient:
     def pop_browser_post_stats(self):
         data = self.browser_post_stats
         self.browser_post_stats = {}
+        return data
+
+    def pop_browser_like_aweme_items(self):
+        data = self.browser_like_items
+        self.browser_like_items = {}
+        return data
+
+    def pop_browser_like_stats(self):
+        data = self.browser_like_stats
+        self.browser_like_stats = {}
         return data
 
 
@@ -284,6 +296,8 @@ def test_user_post_reports_step_and_item_progress(tmp_path, monkeypatch):
 
 def test_user_like_browser_fallback_recovers_missing_items(tmp_path):
     api_client = _FakeAPIClient()
+    api_client.browser_like_items = {"like-2": _make_aweme("like-2")}
+    api_client.browser_like_stats = {"selected_ids": 2, "like_items": 1, "like_pages": 1}
     downloader = _build_downloader(tmp_path, api_client, browser_enabled=True)
     downloader.config = _FakeConfig(
         {
@@ -320,4 +334,44 @@ def test_user_like_browser_fallback_recovers_missing_items(tmp_path):
     assert api_client.like_browser_call_kwargs[0].get("profile_dir") == (
         "./config/playwright-like-cleanup-profile"
     )
-    assert api_client.detail_calls == ["like-2"]
+    assert api_client.detail_calls == []
+
+
+def test_user_like_browser_fallback_keeps_cross_author_items(tmp_path):
+    api_client = _FakeAPIClient()
+    cross_author_item = _make_aweme("like-2")
+    cross_author_item["author"]["sec_uid"] = "another-author"
+    api_client.browser_like_items = {"like-2": cross_author_item}
+    api_client.browser_like_stats = {"selected_ids": 1, "like_items": 1, "like_pages": 1}
+    downloader = _build_downloader(tmp_path, api_client, browser_enabled=True)
+    downloader.config = _FakeConfig(
+        {
+            "number": {"like": 0},
+            "increase": {"like": False},
+            "mode": ["like"],
+            "thread": 2,
+            "browser_fallback": {
+                "enabled": True,
+                "headless": True,
+                "max_scrolls": 10,
+                "idle_rounds": 2,
+                "wait_timeout_seconds": 5,
+            },
+            "like_cleanup": {
+                "enabled": False,
+                "persist_login": True,
+                "profile_dir": "./config/playwright-like-cleanup-profile",
+            },
+        }
+    )
+
+    aweme_list = []
+    asyncio.run(
+        downloader._recover_user_like_with_browser(
+            "sec_uid_x",
+            {"uid": "uid-1", "nickname": "tester"},
+            aweme_list,
+        )
+    )
+
+    assert [item["aweme_id"] for item in aweme_list] == ["like-1", "like-2"]

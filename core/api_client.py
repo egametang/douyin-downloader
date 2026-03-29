@@ -69,6 +69,8 @@ class DouyinAPIClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
         self._browser_post_stats: Dict[str, int] = {}
+        self._browser_like_aweme_items: Dict[str, Dict[str, Any]] = {}
+        self._browser_like_stats: Dict[str, int] = {}
         selected_ua = random.choice(_USER_AGENT_POOL)
         self.headers = {
             "User-Agent": selected_ua,
@@ -712,6 +714,12 @@ class DouyinAPIClient:
         timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
         ids: List[str] = []
         seen: set[str] = set()
+        like_api_ids: List[str] = []
+        like_api_seen: set[str] = set()
+        like_api_aweme_items: Dict[str, Dict[str, Any]] = {}
+        like_api_page_hits = 0
+        self._browser_like_aweme_items = {}
+        self._browser_like_stats = {}
 
         def _merge(values: List[str]) -> None:
             for aweme_id in values or []:
@@ -734,6 +742,45 @@ class DouyinAPIClient:
             )
             pages = getattr(context, "pages", None)
             page = pages[0] if isinstance(pages, list) and pages else await context.new_page()
+            pending_response_tasks: List[asyncio.Task] = []
+
+            async def _handle_response(response) -> None:
+                nonlocal like_api_page_hits
+                url = response.url or ""
+                if "/aweme/v1/web/aweme/favorite/" not in url:
+                    return
+                try:
+                    data = await response.json()
+                except Exception:
+                    return
+                aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
+                if not isinstance(aweme_items, list):
+                    return
+
+                like_api_page_hits += 1
+                extracted: List[str] = []
+                for item in aweme_items:
+                    if not isinstance(item, dict):
+                        continue
+                    aweme_id = item.get("aweme_id")
+                    if not aweme_id:
+                        continue
+                    aweme_id_str = str(aweme_id)
+                    extracted.append(aweme_id_str)
+                    if aweme_id_str not in like_api_aweme_items:
+                        like_api_aweme_items[aweme_id_str] = item
+                _merge(extracted)
+                for aweme_id in extracted:
+                    if aweme_id not in like_api_seen:
+                        like_api_seen.add(aweme_id)
+                        like_api_ids.append(aweme_id)
+
+            def _on_response(response) -> None:
+                pending_response_tasks.append(
+                    asyncio.create_task(_handle_response(response))
+                )
+
+            page.on("response", _on_response)
             try:
                 try:
                     await page.goto(
@@ -814,7 +861,6 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during like fallback warmup")
                             break
-                        _merge(await self._extract_aweme_ids_from_page(page))
                         if ids:
                             break
                         await page.wait_for_timeout(1000)
@@ -839,7 +885,6 @@ class DouyinAPIClient:
                         await page.wait_for_timeout(1200)
 
                         before = len(ids)
-                        _merge(await self._extract_aweme_ids_from_page(page))
                         if len(ids) == before:
                             stable_rounds += 1
                         else:
@@ -855,6 +900,10 @@ class DouyinAPIClient:
                         exc,
                     )
             finally:
+                if pending_response_tasks:
+                    await asyncio.gather(
+                        *pending_response_tasks, return_exceptions=True
+                    )
                 try:
                     browser_cookies = await context.cookies(self.BASE_URL)
                     self._sync_browser_cookies(browser_cookies)
@@ -864,8 +913,26 @@ class DouyinAPIClient:
                 if browser is not None:
                     await browser.close()
 
-        logger.warning("浏览器喜欢页回补采集 aweme_id: selected=%s", len(ids))
-        return self._normalize_aweme_ids(ids)
+        selected_ids: List[str] = []
+        selected_seen: set[str] = set()
+        for aweme_id in like_api_ids:
+            if aweme_id and aweme_id not in selected_seen:
+                selected_seen.add(aweme_id)
+                selected_ids.append(aweme_id)
+
+        self._browser_like_aweme_items = like_api_aweme_items
+        self._browser_like_stats = {
+            "selected_ids": len(selected_ids),
+            "like_items": len(like_api_aweme_items),
+            "like_pages": like_api_page_hits,
+        }
+        logger.warning(
+            "浏览器喜欢页回补采集 aweme_id: selected=%s, like_items=%s, like_pages=%s",
+            len(selected_ids),
+            len(like_api_aweme_items),
+            like_api_page_hits,
+        )
+        return selected_ids
 
     async def cancel_likes_via_browser(
         self,
@@ -1192,6 +1259,16 @@ class DouyinAPIClient:
         self._browser_post_stats = {}
         return stats
 
+    def pop_browser_like_aweme_items(self) -> Dict[str, Dict[str, Any]]:
+        items = self._browser_like_aweme_items
+        self._browser_like_aweme_items = {}
+        return items
+
+    def pop_browser_like_stats(self) -> Dict[str, int]:
+        stats = self._browser_like_stats
+        self._browser_like_stats = {}
+        return stats
+
     def _browser_cookie_payload(
         self, *, include_sensitive: bool = False
     ) -> List[Dict[str, str]]:
@@ -1325,9 +1402,15 @@ class DouyinAPIClient:
 
         return context, browser
 
-    async def _extract_aweme_ids_from_page(self, page) -> List[str]:
+    async def _extract_aweme_ids_from_page(
+        self,
+        page,
+        *,
+        root_selector: Optional[str] = None,
+        include_page_html: bool = True,
+    ) -> List[str]:
         script = """
-() => {
+({ rootSelector, includePageHtml }) => {
   const result = [];
   const seen = new Set();
   const push = (id) => {
@@ -1344,22 +1427,37 @@ class DouyinAPIClient:
     }
   };
 
-  const links = document.querySelectorAll("a[href]");
+  const root = rootSelector ? document.querySelector(rootSelector) : document;
+  if (!root) {
+    return result;
+  }
+
+  const links = root.querySelectorAll("a[href]");
   for (const node of links) {
     const href = node.getAttribute("href") || "";
     collectFrom(href, /\\/video\\/(\\d{15,20})/g);
     collectFrom(href, /\\/note\\/(\\d{15,20})/g);
   }
 
-  const html = document.documentElement ? document.documentElement.innerHTML : "";
-  collectFrom(html, /"aweme_id":"(\\d{15,20})"/g);
-  collectFrom(html, /"group_id":"(\\d{15,20})"/g);
+  if (includePageHtml) {
+    const html = rootSelector
+      ? (root.innerHTML || "")
+      : (document.documentElement ? document.documentElement.innerHTML : "");
+    collectFrom(html, /"aweme_id":"(\\d{15,20})"/g);
+    collectFrom(html, /"group_id":"(\\d{15,20})"/g);
+  }
 
   return result;
 }
 """
         try:
-            data = await page.evaluate(script)
+            data = await page.evaluate(
+                script,
+                {
+                    "rootSelector": str(root_selector or "").strip(),
+                    "includePageHtml": bool(include_page_html),
+                },
+            )
             if isinstance(data, list):
                 return [str(x) for x in data if x]
         except Exception as exc:

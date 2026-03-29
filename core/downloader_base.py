@@ -269,6 +269,29 @@ class BaseDownloader(ABC):
         )
         downloaded_files: List[Path] = []
 
+        def _cleanup_partial_downloads() -> None:
+            for path in reversed(downloaded_files):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed removing partial download %s for aweme %s: %s",
+                        path,
+                        aweme_id,
+                        exc,
+                    )
+            if (
+                not self.config.get("folderstyle", True)
+                or not save_dir.exists()
+                or not save_dir.is_dir()
+            ):
+                return
+            try:
+                if not any(save_dir.iterdir()):
+                    save_dir.rmdir()
+            except OSError:
+                return
+
         session = await self.api_client.get_session()
         video_path: Optional[Path] = None
         video_variant: Optional[str] = None
@@ -307,6 +330,7 @@ class BaseDownloader(ABC):
                         )
                         fallback_request = self._build_no_watermark_url(aweme_data)
                         if not fallback_request:
+                            _cleanup_partial_downloads()
                             return False
                         if not await self._download_with_retry(
                             fallback_request[0],
@@ -314,6 +338,7 @@ class BaseDownloader(ABC):
                             session,
                             headers=fallback_request[1],
                         ):
+                            _cleanup_partial_downloads()
                             return False
                         video_variant = "progressive_mp4"
                     else:
@@ -324,6 +349,7 @@ class BaseDownloader(ABC):
                     if not await self._download_with_retry(
                         video_url, video_path, session, headers=video_headers
                     ):
+                        _cleanup_partial_downloads()
                         return False
                     video_variant = "progressive_mp4"
 
@@ -360,15 +386,15 @@ class BaseDownloader(ABC):
                         downloaded_files.append(music_path)
 
         elif media_type == "gallery":
-            image_urls = self._collect_image_urls(aweme_data)
+            image_url_candidates = self._collect_image_url_candidates(aweme_data)
             image_live_urls = self._collect_image_live_urls(aweme_data)
             logger.info(
                 "Gallery aweme %s: %d image(s), %d live photo(s)",
                 aweme_id,
-                len(image_urls),
+                len(image_url_candidates),
                 len(image_live_urls),
             )
-            if not image_urls and not image_live_urls:
+            if not image_url_candidates and not image_live_urls:
                 logger.error(
                     "No gallery assets found for aweme %s (aweme_type=%s, "
                     "has image_post_info=%s, has images=%s)",
@@ -379,11 +405,11 @@ class BaseDownloader(ABC):
                 )
                 return False
 
-            for index, image_url in enumerate(image_urls, start=1):
-                suffix = self._infer_image_extension(image_url)
+            for index, image_candidates in enumerate(image_url_candidates, start=1):
+                suffix = self._infer_image_extension(image_candidates[0])
                 image_path = save_dir / f"{file_stem}_{index}{suffix}"
-                download_result = await self._download_with_retry(
-                    image_url,
+                download_result = await self._download_from_url_candidates(
+                    image_candidates,
                     image_path,
                     session,
                     headers=self._download_headers(),
@@ -394,6 +420,7 @@ class BaseDownloader(ABC):
                     logger.error(
                         f"Failed downloading image {index} for aweme {aweme_id}"
                     )
+                    _cleanup_partial_downloads()
                     return False
                 downloaded_files.append(
                     download_result if isinstance(download_result, Path) else image_path
@@ -412,6 +439,7 @@ class BaseDownloader(ABC):
                     logger.error(
                         f"Failed downloading live image {index} for aweme {aweme_id}"
                     )
+                    _cleanup_partial_downloads()
                     return False
                 downloaded_files.append(live_path)
         else:
@@ -527,6 +555,61 @@ class BaseDownloader(ABC):
                 f"Download error for {save_path.name}: {error}",
             )
             return False
+
+    async def _download_from_url_candidates(
+        self,
+        url_candidates: List[str],
+        save_path: Path,
+        session,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        optional: bool = False,
+        prefer_response_content_type: bool = False,
+        return_saved_path: bool = False,
+    ) -> Union[bool, Path]:
+        normalized_candidates: List[str] = []
+        seen: set[str] = set()
+        for candidate in url_candidates or []:
+            candidate_str = str(candidate or "").strip()
+            if not candidate_str or candidate_str in seen:
+                continue
+            seen.add(candidate_str)
+            normalized_candidates.append(candidate_str)
+
+        if not normalized_candidates:
+            return False
+
+        log_fn = logger.warning if optional else logger.error
+        total_candidates = len(normalized_candidates)
+        last_candidate = normalized_candidates[-1]
+        for index, candidate in enumerate(normalized_candidates, start=1):
+            download_result = await self.file_manager.download_file(
+                candidate,
+                save_path,
+                session,
+                headers=headers,
+                proxy=getattr(self.api_client, "proxy", None),
+                prefer_response_content_type=prefer_response_content_type,
+                return_saved_path=return_saved_path,
+            )
+            if download_result:
+                return download_result
+            if index < total_candidates:
+                logger.warning(
+                    "Download candidate failed for %s, trying next source (%s/%s)",
+                    save_path.name,
+                    index,
+                    total_candidates,
+                )
+
+        self._log_download_error(
+            log_fn,
+            (
+                f"Download error for {save_path.name}: all "
+                f"{total_candidates} candidate URLs failed; last={last_candidate}"
+            ),
+        )
+        return False
 
     async def _download_dash_video(
         self,
@@ -908,45 +991,44 @@ class BaseDownloader(ABC):
         return "540p"
 
     def _collect_image_urls(self, aweme_data: Dict[str, Any]) -> List[str]:
-        image_urls = []
-        for item in self._iter_gallery_items(aweme_data):
-            if not isinstance(item, dict):
-                continue
-            # 优先拿可下载/原图字段，避免 preview/display 图链签名失效后整组图文失败。
-            # 同时兼容旧格式 download_url_list（直接 list）和新格式 download_url（dict with url_list）。
-            image_url = self._pick_first_media_url(
-                item.get("download_url"),
-                item.get("download_addr"),
-                item.get("download_url_list"),
-                item,
-                item.get("display_image"),
-                item.get("owner_watermark_image"),
-            )
-            if image_url:
-                image_urls.append(image_url)
-        gallery_items = self._iter_gallery_items(aweme_data)
-        for item in gallery_items:
-            if not isinstance(item, dict):
-                continue
-            # 优先拿可下载/原图字段，避免 preview/display 图链签名失效后整组图文失败。
-            # 同时兼容旧格式 download_url_list（直接 list）和新格式 download_url（dict with url_list）。
-            image_url = self._pick_first_media_url(
-                item.get("download_url"),
-                item.get("download_addr"),
-                item.get("download_url_list"),
-                item,
-                item.get("display_image"),
-                item.get("owner_watermark_image"),
-            )
-            if image_url:
-                image_urls.append(image_url)
+        image_url_candidates = self._collect_image_url_candidates(aweme_data)
+        image_urls = [candidates[0] for candidates in image_url_candidates if candidates]
         if not image_urls:
             logger.warning(
                 "No image URLs extracted for aweme %s; gallery items count=%d",
                 aweme_data.get("aweme_id"),
-                len(gallery_items),
+                len(self._iter_gallery_items(aweme_data)),
             )
         return self._deduplicate_urls(image_urls)
+
+    def _collect_image_url_candidates(self, aweme_data: Dict[str, Any]) -> List[List[str]]:
+        gallery_items = self._iter_gallery_items(aweme_data)
+        image_candidates: List[List[str]] = []
+        for item in gallery_items:
+            if not isinstance(item, dict):
+                continue
+            candidates = self._collect_gallery_item_image_candidates(item)
+            if candidates:
+                image_candidates.append(candidates)
+        return image_candidates
+
+    def _collect_gallery_item_image_candidates(self, item: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+        for source in (
+            item.get("download_url"),
+            item.get("download_addr"),
+            item.get("download_url_list"),
+            item,
+            item.get("display_image"),
+            item.get("owner_watermark_image"),
+        ):
+            for candidate in self._extract_url_candidates(source):
+                if not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(candidate)
+        return candidates
 
     def _collect_image_live_urls(self, aweme_data: Dict[str, Any]) -> List[str]:
         live_urls: List[str] = []
