@@ -142,18 +142,28 @@ class UserDownloader(BaseDownloader):
         else:
             logger.warning("Like cleanup finished: success=%s", success_count)
 
-    async def _wait_for_like_cleanup_login_confirmation(self, message: str) -> None:
+    async def _wait_for_manual_browser_confirmation(
+        self, step_name: str, message: str
+    ) -> None:
         prompt = (
             str(message or "").strip()
             or "请在浏览器中完成抖音登录，然后回到终端按 Enter 继续。"
         )
         logger.warning(prompt)
-        self._progress_update_step("取消点赞", "等待人工确认登录")
+        self._progress_update_step(step_name, "等待人工确认")
         try:
             await asyncio.to_thread(input)
         except EOFError:
-            logger.warning("Terminal input unavailable while waiting manual login confirmation")
-        self._progress_update_step("取消点赞", "已收到人工确认，继续执行")
+            logger.warning("Terminal input unavailable while waiting manual confirmation")
+        self._progress_update_step(step_name, "已收到人工确认，继续执行")
+
+    async def _wait_for_like_cleanup_login_confirmation(self, message: str) -> None:
+        await self._wait_for_manual_browser_confirmation("取消点赞", message)
+
+    async def _wait_for_manual_browser_confirmation_like_recovery(
+        self, message: str
+    ) -> None:
+        await self._wait_for_manual_browser_confirmation("浏览器回补", message)
 
     def _validate_mode_scope(self, sec_uid: str, modes: List[str]) -> bool:
         normalized_modes = {str(mode or "").strip() for mode in modes}
@@ -393,3 +403,99 @@ class UserDownloader(BaseDownloader):
                 detail_failed,
                 total_missing,
             )
+
+    async def _recover_user_like_with_browser(
+        self,
+        sec_uid: str,
+        user_info: Dict[str, Any],
+        aweme_list: List[Dict[str, Any]],
+    ) -> None:
+        browser_cfg = self.config.get("browser_fallback", {}) or {}
+        if not browser_cfg.get("enabled", True):
+            return
+
+        number_limit = self.config.get("number", {}).get("like", 0)
+        expected_count = int(number_limit or 0)
+        if expected_count and len(aweme_list) >= expected_count:
+            return
+
+        like_cleanup_cfg = self.config.get("like_cleanup", {}) or {}
+        profile_dir = None
+        if isinstance(like_cleanup_cfg, dict) and self._config_bool(
+            like_cleanup_cfg.get("persist_login"), default=True
+        ):
+            raw_profile_dir = str(
+                like_cleanup_cfg.get(
+                    "profile_dir", "./config/playwright-like-cleanup-profile"
+                )
+                or ""
+            ).strip()
+            if raw_profile_dir:
+                profile_dir = raw_profile_dir
+
+        try:
+            browser_aweme_ids = await self.api_client.collect_user_like_ids_via_browser(
+                sec_uid,
+                expected_count=expected_count,
+                headless=bool(browser_cfg.get("headless", False)),
+                max_scrolls=int(browser_cfg.get("max_scrolls", 240) or 240),
+                idle_rounds=int(browser_cfg.get("idle_rounds", 8) or 8),
+                wait_timeout_seconds=int(
+                    browser_cfg.get("wait_timeout_seconds", 600) or 600
+                ),
+                profile_dir=profile_dir,
+                login_confirmation_callback=self._wait_for_manual_browser_confirmation_like_recovery,
+            )
+        except Exception as exc:
+            logger.error("Like browser fallback failed: %s", exc)
+            return
+
+        if not browser_aweme_ids:
+            logger.warning("Like browser fallback returned no aweme_id")
+            return
+
+        existing_ids = {
+            str(item.get("aweme_id")) for item in aweme_list if item.get("aweme_id")
+        }
+        missing_ids = [
+            aweme_id for aweme_id in browser_aweme_ids if aweme_id not in existing_ids
+        ]
+        if not missing_ids:
+            return
+
+        logger.warning(
+            "Recovering liked aweme details from browser list, missing count=%s",
+            len(missing_ids),
+        )
+        detail_failed = 0
+        detail_success = 0
+        total_missing = len(missing_ids)
+        for index, aweme_id in enumerate(missing_ids, start=1):
+            if number_limit > 0 and len(aweme_list) >= number_limit:
+                break
+
+            if index == 1 or index == total_missing or index % 5 == 0:
+                self._progress_update_step(
+                    "浏览器回补", f"补全喜欢详情 {index}/{total_missing}"
+                )
+
+            await self.rate_limiter.acquire()
+            detail = await self.api_client.get_video_detail(
+                aweme_id, suppress_error=True
+            )
+            if not detail:
+                detail_failed += 1
+                continue
+            detail_success += 1
+            aweme_list.append(detail)
+
+        self._progress_update_step(
+            "浏览器回补",
+            f"喜欢回补完成，补拉成功 {detail_success}，失败 {detail_failed}",
+        )
+        logger.warning(
+            "Like browser fallback summary: merged_ids=%s detail_success=%s detail_failed=%s",
+            len(browser_aweme_ids),
+            detail_success,
+            detail_failed,
+        )

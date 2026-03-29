@@ -73,8 +73,10 @@ Operator behavior:
 Interpretation:
 
 - Early `0` total items with valid cookies can be legitimate if the account has no visible liked items.
+- If the API path stalls or returns zero, the repo can continue into `浏览器回补`; do not stop that recovery path unless browser login or verification is required.
 - Nonzero total items means the like list is accessible and downloads should proceed.
 - The unlike step only applies to items that downloaded successfully in `mode: like`.
+- The unlike path should use Douyin `批量管理` and cancel a batch of selected items in one confirmation cycle.
 - If unlike cleanup surfaces a login page, pause and wait for explicit user confirmation before resuming.
 - After any interrupted run, clear residual processes before launching the browser again.
 
@@ -88,11 +90,28 @@ Useful variants:
 
 ```bash
 ./.venv/bin/python tools/cancel_downloaded_likes.py -c config.yml --limit 20
+./.venv/bin/python tools/cancel_downloaded_likes.py -c config.yml --batch-scope latest
+./.venv/bin/python tools/cancel_downloaded_likes.py -c config.yml --batch-scope all
 ./.venv/bin/python tools/cancel_downloaded_likes.py -c config.yml --source db
 ./.venv/bin/python tools/cancel_downloaded_likes.py -c config.yml --aweme-id 123 --aweme-id 456
 ```
 
 Always run the residual-process check first so only one cleanup process owns the Playwright profile at a time.
+
+Default note:
+
+- `cancel_downloaded_likes.py` now defaults to `--batch-scope latest`.
+- That default covers the latest database-backed download batch, not every locally existing file.
+
+## Local Existing Files
+
+If the main run reported skipped items because media files already exist locally and the user still wants those likes removed, use this additional checklist:
+
+1. Build the local `aweme_id` set from media filenames in the configured download path.
+2. Collect the current likes page with `collect_user_like_ids_via_browser(...)`.
+3. Intersect current likes with the local-id set.
+4. Retry cleanup with explicit `--aweme-id` arguments for that intersection.
+5. Verify by recollecting current likes and confirming the local-file intersection is zero.
 
 ## Common Failure Patterns
 
@@ -117,3 +136,19 @@ Check in this order:
 ### Downloads succeeded but some unlikes failed
 
 Use the cleanup-only tool and retry failed `aweme_id` values explicitly.
+
+### Batch unlike reports a verification failure
+
+Check in this order:
+
+1. Recollect the current likes page before assuming the batch really failed.
+2. If the supposedly failed ids are already gone from the likes page, treat the batch as successful and move on.
+3. If they are still present, rerun cleanup with explicit `--aweme-id` values for the remaining ids only.
+
+### Skipped files are still liked
+
+Check in this order:
+
+1. Confirm the skipped items were local-file skips, not just database-backed latest-batch exclusions.
+2. Build the current-likes and local-file intersection.
+3. Cleanup those remaining ids explicitly.

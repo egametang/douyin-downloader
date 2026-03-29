@@ -1,6 +1,6 @@
 ---
 name: douyin-liked-download-cleanup
-description: Run the douyin-downloader project to download liked Douyin videos or galleries from a logged-in account and cancel likes after successful downloads. Use when the user wants this repo to fetch liked items with mode like, refresh cookies with Playwright, troubleshoot empty like lists caused by missing login cookies such as sessionid or sid_tt, or rerun unlike cleanup for already-downloaded items.
+description: Run the douyin-downloader project to download liked Douyin videos or galleries from a logged-in account and cancel likes after successful downloads. Use when the user wants this repo to fetch liked items with mode like, recover empty or paginated like lists through browser fallback, batch unlike downloaded items through Douyin bulk-manage UI, or clean up likes for files that already exist locally.
 ---
 
 # Douyin Liked Download Cleanup
@@ -13,8 +13,9 @@ Use this skill only when the current workspace is the `douyin-downloader` projec
 2. Verify the local runtime before changing anything.
 3. Inspect `config.yml` and confirm the like-download path is enabled.
 4. Refresh cookies with Playwright when login cookies are missing or the first like run returns zero items unexpectedly.
-5. Run the downloader and monitor the download phase and the unlike-cleanup phase separately.
+5. Run the downloader and monitor the like-discovery phase, download phase, and unlike-cleanup phase separately.
 6. If downloads already succeeded earlier, run the cleanup-only tool against the database or manifest.
+7. If the user also wants likes removed for files that were skipped because they already exist locally, intersect the current likes page with the local media index and unlike those explicit `aweme_id` values too.
 
 Never treat "browser opened" as "login succeeded". After opening a browser for login, stop and wait for the user to explicitly confirm login success in chat before sending Enter or starting the next command.
 
@@ -92,11 +93,16 @@ Run:
 
 Watch for these phases:
 
-- Like list discovery: the run should move past zero items and report a total item count.
+- Like list discovery: the run should move past zero items and report a total item count. If the API list stalls or returns zero while the user expects likes, let the repo continue into `浏览器回补` before assuming the run failed.
 - Download phase: track success, failure, and skipped counts.
-- Unlike phase: after successful like downloads, the tool should enter the `取消点赞` step. If the browser requests login again, stop and wait for the user to explicitly confirm login success before continuing.
+- Unlike phase: after successful like downloads, the tool should enter the `取消点赞` step. The browser path now uses Douyin's `批量管理` UI and should cancel a batch at a time rather than confirming each item one by one. If the browser requests login again, stop and wait for the user to explicitly confirm login success before continuing.
 
 Before rerunning the main flow after an interruption, repeat the residual-process check so you do not stack multiple Playwright sessions onto the same profile.
+
+Important scope detail:
+
+- `douyin-dl -c config.yml` only auto-unlikes items that downloaded successfully in the current run.
+- Items skipped because the media file already exists locally are not part of that current-run success list.
 
 If the like list still comes back empty after cookie refresh, assume one of these before changing code:
 
@@ -117,10 +123,28 @@ Useful flags:
 - `--limit N`
 - `--source db`
 - `--source manifest`
+- `--batch-scope latest`
+- `--batch-scope all`
 - `--aweme-id <id>` repeated for targeted retries
 - `--profile-dir config/playwright-like-cleanup-profile`
 
 Before any cleanup-only retry, repeat the residual-process check and clear old processes first.
+
+`--batch-scope latest` is now the default behavior. Use `--batch-scope all` only when the user explicitly wants historical database-backed downloads cleaned up as well.
+
+## Local-Existing Cleanup
+
+Use this when the main download run reported skipped items because the files already existed locally and the user still wants those likes removed.
+
+Do not rely on `--batch-scope latest` alone for this case. Some locally existing files may not belong to the latest database batch, and some may exist only as local files.
+
+Instead:
+
+1. Build the local media `aweme_id` index using the same file-name scan rules as `BaseDownloader._build_local_aweme_index`.
+2. Collect the current likes page through `collect_user_like_ids_via_browser(...)`.
+3. Intersect `current_like_ids` with local media ids.
+4. Run `tools/cancel_downloaded_likes.py -c config.yml --aweme-id ...` with the explicit remaining ids.
+5. Recollect the current likes page and confirm the local-file intersection is now zero.
 
 ## Troubleshooting
 

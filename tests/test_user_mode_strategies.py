@@ -34,12 +34,51 @@ def test_like_strategy_collects_items_from_api():
             self.rate_limiter = _NoopRateLimiter()
             self.config = type("Cfg", (), {"get": lambda _self, key, default=None: {"number": {"like": 0}, "increase": {"like": False}}.get(key, default)})()
             self.database = None
+            self._progress_update_step = lambda *_args, **_kwargs: None
             self._filter_by_time = lambda items: items
             self._limit_count = lambda items, _mode: items
 
     strategy = LikeUserModeStrategy(_Downloader())
     items = asyncio.run(strategy.collect_items("sec_uid_x", {"uid": "uid-1"}))
     assert [item["aweme_id"] for item in items] == ["111"]
+
+
+def test_like_strategy_calls_browser_recover_when_api_returns_empty():
+    class _API:
+        async def get_user_like(self, _sec_uid, max_cursor=0, count=20):
+            return {"items": [], "has_more": False, "max_cursor": max_cursor, "status_code": 0}
+
+    class _Downloader:
+        def __init__(self):
+            self.api_client = _API()
+            self.rate_limiter = _NoopRateLimiter()
+            self.database = None
+            self.config = type(
+                "Cfg",
+                (),
+                {
+                    "get": lambda _self, key, default=None: {
+                        "number": {"like": 0},
+                        "increase": {"like": False},
+                        "browser_fallback": {"enabled": True},
+                    }.get(key, default)
+                },
+            )()
+            self.recovered_called = False
+            self._progress_update_step = lambda *_args, **_kwargs: None
+            self._filter_by_time = lambda items: items
+            self._limit_count = lambda items, _mode: items
+
+        async def _recover_user_like_with_browser(self, sec_uid, user_info, aweme_list):
+            self.recovered_called = True
+            aweme_list.append(_make_aweme("222"))
+
+    downloader = _Downloader()
+    strategy = LikeUserModeStrategy(downloader)
+    items = asyncio.run(strategy.collect_items("sec_uid_x", {"uid": "uid-1"}))
+
+    assert downloader.recovered_called is True
+    assert [item["aweme_id"] for item in items] == ["222"]
 
 
 def test_post_strategy_calls_browser_recover_when_pagination_restricted():

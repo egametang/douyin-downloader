@@ -312,20 +312,39 @@ def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
         {"msToken": "token-1", "sessionid": "sess", "sid_tt": "sid-tt"}
     )
     progress_events = []
-    signed_calls = []
+    batch_calls = []
 
-    async def _fake_cancel_like(page, aweme_id):
+    async def _fake_cancel_like_batch(page, aweme_ids):
         assert page is not None
-        signed_calls.append({"aweme_id": aweme_id})
-        if aweme_id == "111":
-            return {"http_status": 200, "status_code": 0, "status_msg": ""}
+        aweme_ids = [str(aweme_id) for aweme_id in aweme_ids]
+        batch_calls.append(list(aweme_ids))
+        item_responses = {}
+        for aweme_id in aweme_ids:
+            if aweme_id == "111":
+                item_responses[aweme_id] = {
+                    "http_status": 200,
+                    "status_code": 0,
+                    "status_msg": "",
+                }
+            else:
+                item_responses[aweme_id] = {
+                    "http_status": 200,
+                    "status_code": 5,
+                    "status_msg": "failed",
+                }
         return {
-            "http_status": 200,
-            "status_code": 5,
-            "status_msg": "failed",
+            "selected_ids": list(aweme_ids),
+            "item_responses": item_responses,
+            "batch_response": {
+                "http_status": 200,
+                "status_code": 0,
+                "status_msg": "",
+            },
         }
 
-    monkeypatch.setattr(client, "_cancel_like_via_bulk_manage", _fake_cancel_like)
+    monkeypatch.setattr(
+        client, "_cancel_like_batch_via_bulk_manage", _fake_cancel_like_batch
+    )
 
     result = asyncio.run(
         client.cancel_likes_via_browser(
@@ -342,10 +361,7 @@ def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
     assert result["failed_ids"] == ["222"]
     assert any(cookie["name"] == "sessionid" for cookie in context.added_cookies)
     assert any(cookie["name"] == "sid_tt" for cookie in context.added_cookies)
-    assert signed_calls == [
-        {"aweme_id": "111"},
-        {"aweme_id": "222"},
-    ]
+    assert batch_calls == [["111", "222"]]
     assert [event["status"] for event in progress_events] == ["success", "failed"]
 
 
@@ -434,14 +450,32 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
         {"msToken": "token-1", "sessionid": "sess", "sid_tt": "sid-tt"}
     )
     profile_dir = tmp_path / "profile"
-    signed_calls = []
+    batch_calls = []
 
-    async def _fake_cancel_like(page, aweme_id):
+    async def _fake_cancel_like_batch(page, aweme_ids):
         assert page is not None
-        signed_calls.append({"aweme_id": aweme_id})
-        return {"http_status": 200, "status_code": 0, "status_msg": ""}
+        aweme_ids = [str(aweme_id) for aweme_id in aweme_ids]
+        batch_calls.append(list(aweme_ids))
+        return {
+            "selected_ids": list(aweme_ids),
+            "item_responses": {
+                aweme_id: {
+                    "http_status": 200,
+                    "status_code": 0,
+                    "status_msg": "",
+                }
+                for aweme_id in aweme_ids
+            },
+            "batch_response": {
+                "http_status": 200,
+                "status_code": 0,
+                "status_msg": "",
+            },
+        }
 
-    monkeypatch.setattr(client, "_cancel_like_via_bulk_manage", _fake_cancel_like)
+    monkeypatch.setattr(
+        client, "_cancel_like_batch_via_bulk_manage", _fake_cancel_like_batch
+    )
 
     result = asyncio.run(
         client.cancel_likes_via_browser(
@@ -459,7 +493,131 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
     added_names = {cookie["name"] for cookie in context.added_cookies}
     assert {"msToken", "sid_tt"} <= added_names
     assert "sessionid" not in added_names
-    assert signed_calls == [{"aweme_id": "111"}]
+    assert batch_calls == [["111"]]
+
+
+def test_cancel_likes_via_browser_batches_requests(monkeypatch):
+    class _FakePage:
+        def __init__(self):
+            self.context = None
+
+        async def goto(self, *args, **kwargs):
+            return
+
+        async def title(self):
+            return "抖音"
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _ms):
+            return
+
+    class _FakeContext:
+        def __init__(self, page):
+            self._page = page
+            self._page.context = self
+            self.pages = [page]
+
+        async def add_cookies(self, _cookies):
+            return
+
+        async def new_page(self):
+            return self._page
+
+        async def cookies(self, _base_url):
+            return [{"name": "sessionid", "value": "sess", "domain": ".douyin.com"}]
+
+        async def close(self):
+            return
+
+    class _FakeBrowser:
+        def __init__(self, context):
+            self._context = context
+
+        async def new_context(self, **_kwargs):
+            return self._context
+
+        async def close(self):
+            return
+
+    class _FakeChromium:
+        def __init__(self, browser):
+            self._browser = browser
+
+        async def launch(self, **_kwargs):
+            return self._browser
+
+    class _FakePlaywright:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+    class _FakePlaywrightManager:
+        def __init__(self, playwright):
+            self._playwright = playwright
+
+        async def __aenter__(self):
+            return self._playwright
+
+        async def __aexit__(self, *_args):
+            return
+
+    page = _FakePage()
+    context = _FakeContext(page)
+    browser = _FakeBrowser(context)
+    chromium = _FakeChromium(browser)
+    playwright = _FakePlaywright(chromium)
+    manager = _FakePlaywrightManager(playwright)
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: manager
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient({"sessionid": "sess", "sid_tt": "sid-tt"})
+    progress_events = []
+    batch_calls = []
+
+    async def _fake_cancel_like_batch(page, aweme_ids):
+        assert page is not None
+        aweme_ids = [str(aweme_id) for aweme_id in aweme_ids]
+        batch_calls.append(list(aweme_ids))
+        return {
+            "selected_ids": list(aweme_ids),
+            "item_responses": {
+                aweme_id: {
+                    "http_status": 200,
+                    "status_code": 0,
+                    "status_msg": "",
+                }
+                for aweme_id in aweme_ids
+            },
+            "batch_response": {
+                "http_status": 200,
+                "status_code": 0,
+                "status_msg": "",
+            },
+        }
+
+    monkeypatch.setattr(
+        client, "_cancel_like_batch_via_bulk_manage", _fake_cancel_like_batch
+    )
+
+    aweme_ids = [str(100 + index) for index in range(9)]
+    result = asyncio.run(
+        client.cancel_likes_via_browser(
+            aweme_ids,
+            headless=False,
+            wait_timeout_seconds=60,
+            request_interval_ms=10,
+            progress_callback=progress_events.append,
+        )
+    )
+
+    assert result["success_ids"] == aweme_ids
+    assert batch_calls == [aweme_ids[:8], aweme_ids[8:]]
+    assert len(progress_events) == 9
 
 
 def test_cancel_likes_via_browser_fails_fast_when_login_ui_still_visible(

@@ -1,4 +1,4 @@
 interface:
   display_name: "Douyin Likes Download"
-  short_description: "用 douyin-downloader 下载点赞并自动取消点赞"
-  default_prompt: "Use $douyin-liked-download-cleanup to run this repo for Douyin liked-video downloads and unlike each item after a successful download."
+  short_description: "下载当前点赞并批量取消点赞，必要时补清理本地已有文件对应的点赞"
+  default_prompt: "Use $douyin-liked-download-cleanup to run this repo for current Douyin likes, recover the like list through browser fallback when needed, batch unlike downloaded items through bulk-manage UI, and also clean likes for already-local files when the user asks."

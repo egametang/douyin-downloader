@@ -688,6 +688,185 @@ class DouyinAPIClient:
         )
         return selected_ids
 
+    async def collect_user_like_ids_via_browser(
+        self,
+        sec_uid: str,
+        *,
+        expected_count: int = 0,
+        headless: bool = False,
+        max_scrolls: int = 240,
+        idle_rounds: int = 8,
+        wait_timeout_seconds: int = 600,
+        profile_dir: Optional[str] = None,
+        login_confirmation_callback=None,
+    ) -> List[str]:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available for like browser fallback: %s", exc)
+            return []
+
+        normalized_sec_uid = str(sec_uid or "").strip() or "self"
+        target_user = "self" if normalized_sec_uid == "self" else normalized_sec_uid
+        target_url = f"{self.BASE_URL}/user/{target_user}?showTab=like"
+        timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
+        ids: List[str] = []
+        seen: set[str] = set()
+
+        def _merge(values: List[str]) -> None:
+            for aweme_id in values or []:
+                aweme_id_str = str(aweme_id or "").strip()
+                if aweme_id_str and aweme_id_str not in seen:
+                    seen.add(aweme_id_str)
+                    ids.append(aweme_id_str)
+
+        logger.warning(
+            "点赞页API受限，启动浏览器兜底采集（可在弹出页面手动通过验证码/登录）：%s",
+            target_url,
+        )
+
+        async with async_playwright() as playwright:
+            context, browser = await self._create_browser_context(
+                playwright,
+                headless=headless,
+                include_sensitive_cookies=True,
+                profile_dir=profile_dir,
+            )
+            pages = getattr(context, "pages", None)
+            page = pages[0] if isinstance(pages, list) and pages else await context.new_page()
+            try:
+                try:
+                    await page.goto(
+                        target_url, wait_until="domcontentloaded", timeout=timeout_ms
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Browser goto timeout or error before like browser fallback: %s",
+                        exc,
+                    )
+
+                title = ""
+                try:
+                    title = await page.title()
+                except Exception:
+                    pass
+                if "验证码" in title:
+                    if headless:
+                        logger.warning(
+                            "检测到验证码页面且当前为 headless 模式，无法人工验证。"
+                            "请将 browser_fallback.headless 设为 false。"
+                        )
+                        return []
+                    logger.warning(
+                        "检测到验证码页面，请在浏览器中完成验证，程序会自动继续采集喜欢列表。"
+                    )
+                    await self._wait_for_manual_verification(
+                        page, wait_timeout_seconds=wait_timeout_seconds
+                    )
+                    if not page.is_closed():
+                        try:
+                            await page.goto(
+                                target_url,
+                                wait_until="domcontentloaded",
+                                timeout=timeout_ms,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Reload like page after verification failed: %s", exc
+                            )
+
+                if not headless and not await self._page_ready_for_like_actions(page):
+                    logger.warning(
+                        "未检测到完整登录态，如浏览器弹出登录页，请先完成登录后程序会继续采集喜欢列表。"
+                    )
+                    if callable(login_confirmation_callback):
+                        try:
+                            maybe_awaitable = login_confirmation_callback(
+                                "请在弹出的浏览器中完成抖音登录，然后回到终端按 Enter 继续。"
+                            )
+                            if asyncio.iscoroutine(maybe_awaitable):
+                                await maybe_awaitable
+                        except Exception as exc:
+                            logger.debug(
+                                "Like browser fallback login confirmation callback failed: %s",
+                                exc,
+                            )
+                    login_ready = await self._wait_for_manual_login(
+                        page, wait_timeout_seconds=wait_timeout_seconds
+                    )
+                    if not login_ready:
+                        logger.warning("手动登录后页面仍未进入已登录状态，停止喜欢列表回补。")
+                        return []
+
+                scroller = page.locator(
+                    "div.parent-route-container.route-scroll-container, "
+                    "div.parent-route-container.XoIW2IMs.route-scroll-container"
+                ).first
+                has_scroller = False
+                try:
+                    has_scroller = await scroller.count() > 0
+                except Exception:
+                    has_scroller = False
+
+                try:
+                    warmup_seconds = min(20, max(3, int(wait_timeout_seconds)))
+                    for _ in range(warmup_seconds):
+                        if page.is_closed():
+                            logger.warning("Browser page closed during like fallback warmup")
+                            break
+                        _merge(await self._extract_aweme_ids_from_page(page))
+                        if ids:
+                            break
+                        await page.wait_for_timeout(1000)
+
+                    stable_rounds = 0
+                    max_scroll_rounds = max(1, int(max_scrolls))
+                    idle_stop_rounds = max(1, int(idle_rounds))
+
+                    for _ in range(max_scroll_rounds):
+                        if page.is_closed():
+                            logger.warning("Browser page closed during like fallback scrolling")
+                            break
+
+                        if has_scroller:
+                            try:
+                                await scroller.evaluate("(el) => { el.scrollBy(0, 1600); }")
+                            except Exception as exc:
+                                logger.debug("Like list scroller scroll failed: %s", exc)
+                                await page.mouse.wheel(0, 3200)
+                        else:
+                            await page.mouse.wheel(0, 3200)
+                        await page.wait_for_timeout(1200)
+
+                        before = len(ids)
+                        _merge(await self._extract_aweme_ids_from_page(page))
+                        if len(ids) == before:
+                            stable_rounds += 1
+                        else:
+                            stable_rounds = 0
+
+                        if expected_count > 0 and len(ids) >= expected_count:
+                            break
+                        if expected_count <= 0 and stable_rounds >= idle_stop_rounds:
+                            break
+                except Exception as exc:
+                    logger.warning(
+                        "Like browser collection interrupted, use collected ids so far: %s",
+                        exc,
+                    )
+            finally:
+                try:
+                    browser_cookies = await context.cookies(self.BASE_URL)
+                    self._sync_browser_cookies(browser_cookies)
+                except Exception as exc:
+                    logger.debug("Sync browser cookies skipped: %s", exc)
+                await context.close()
+                if browser is not None:
+                    await browser.close()
+
+        logger.warning("浏览器喜欢页回补采集 aweme_id: selected=%s", len(ids))
+        return self._normalize_aweme_ids(ids)
+
     async def cancel_likes_via_browser(
         self,
         aweme_ids: List[str],
@@ -820,10 +999,14 @@ class DouyinAPIClient:
                         result["failed_ids"] = list(normalized_ids)
                         return self._finalize_like_cleanup_result(result)
 
-                for index, aweme_id in enumerate(normalized_ids, start=1):
+                batch_size = 8
+                processed_count = 0
+                total_count = len(normalized_ids)
+                for batch_start in range(0, total_count, batch_size):
+                    batch_ids = normalized_ids[batch_start : batch_start + batch_size]
                     if page.is_closed():
                         logger.warning("Browser page closed during like cleanup")
-                        result["failed_ids"].extend(normalized_ids[index - 1 :])
+                        result["failed_ids"].extend(normalized_ids[batch_start:])
                         break
 
                     try:
@@ -835,12 +1018,18 @@ class DouyinAPIClient:
                             exc,
                         )
 
-                    response = await self._cancel_like_via_bulk_manage(page, aweme_id)
-                    status_code = self._as_int(response.get("status_code"), default=-1)
+                    batch_result = await self._cancel_like_batch_via_bulk_manage(
+                        page, batch_ids
+                    )
+                    batch_response = batch_result.get("batch_response") or {}
+                    status_code = self._as_int(
+                        batch_response.get("status_code"), default=-1
+                    )
                     needs_manual_reauth = status_code == 8 or self._as_int(
-                        response.get("http_status"), default=0
+                        batch_response.get("http_status"), default=0
                     ) == 403
                     if needs_manual_reauth and not headless:
+                        aweme_id = batch_ids[0] if batch_ids else ""
                         if callable(progress_callback):
                             try:
                                 progress_callback(
@@ -851,15 +1040,17 @@ class DouyinAPIClient:
                                     }
                                 )
                             except Exception as exc:
-                                logger.debug("Like cleanup progress callback failed: %s", exc)
+                                logger.debug(
+                                    "Like cleanup progress callback failed: %s", exc
+                                )
                         logger.warning(
-                            "取消点赞返回未登录或请求被拒绝，请在浏览器中完成登录/验证，程序会自动重试。"
+                            "批量取消点赞返回未登录或请求被拒绝，请在浏览器中完成登录/验证，程序会自动重试当前批次。"
                         )
                         login_ready = False
                         if callable(login_confirmation_callback):
                             try:
                                 maybe_awaitable = login_confirmation_callback(
-                                    f"作品 {aweme_id} 取消点赞请求需要重新登录或验证。请先在浏览器完成操作，然后回到终端按 Enter 继续。"
+                                    f"当前批次取消点赞需要重新登录或验证。请先在浏览器完成操作，然后回到终端按 Enter 继续。"
                                 )
                                 if asyncio.iscoroutine(maybe_awaitable):
                                     await maybe_awaitable
@@ -875,7 +1066,7 @@ class DouyinAPIClient:
                             logger.warning(
                                 "手动登录后页面仍未进入已登录状态，停止后续取消点赞。"
                             )
-                            result["failed_ids"].extend(normalized_ids[index - 1 :])
+                            result["failed_ids"].extend(normalized_ids[batch_start:])
                             break
                         if not page.is_closed():
                             try:
@@ -897,54 +1088,87 @@ class DouyinAPIClient:
                                     "Sync browser cookies after manual login failed: %s",
                                     exc,
                                 )
-                            response = await self._cancel_like_via_bulk_manage(
-                                page, aweme_id
-                            )
-                            status_code = self._as_int(
-                                response.get("status_code"), default=-1
+                            batch_result = await self._cancel_like_batch_via_bulk_manage(
+                                page, batch_ids
                             )
 
-                    if status_code == 0:
-                        result["success_ids"].append(aweme_id)
-                        progress_status = "success"
-                    else:
-                        result["failed_ids"].append(aweme_id)
-                        progress_status = "failed"
-                        logger.warning(
-                            "取消点赞失败 aweme_id=%s, status_code=%s, status_msg=%s, http_status=%s",
+                    item_responses = batch_result.get("item_responses") or {}
+                    for aweme_id in batch_ids:
+                        processed_count += 1
+                        response = item_responses.get(
                             aweme_id,
-                            status_code,
-                            response.get("status_msg") or "",
-                            response.get("http_status"),
+                            {
+                                "http_status": 0,
+                                "status_code": 5,
+                                "status_msg": "bulk_unlike_unknown",
+                                "body": "",
+                            },
                         )
+                        item_status_code = self._as_int(
+                            response.get("status_code"), default=-1
+                        )
+                        if item_status_code == 0:
+                            result["success_ids"].append(aweme_id)
+                            progress_status = "success"
+                        else:
+                            result["failed_ids"].append(aweme_id)
+                            progress_status = "failed"
+                            logger.warning(
+                                "取消点赞失败 aweme_id=%s, status_code=%s, status_msg=%s, http_status=%s",
+                                aweme_id,
+                                item_status_code,
+                                response.get("status_msg") or "",
+                                response.get("http_status"),
+                            )
 
-                    if callable(progress_callback):
+                        if callable(progress_callback):
+                            try:
+                                progress_callback(
+                                    {
+                                        "index": processed_count,
+                                        "total": total_count,
+                                        "aweme_id": aweme_id,
+                                        "status": progress_status,
+                                        "status_code": item_status_code,
+                                        "status_msg": response.get("status_msg") or "",
+                                    }
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "Like cleanup progress callback failed: %s", exc
+                                )
+
+                    if page.is_closed():
+                        result["failed_ids"].extend(
+                            normalized_ids[batch_start + len(batch_ids) :]
+                        )
+                        break
+
+                    has_more_batches = batch_start + batch_size < total_count
+                    if has_more_batches:
                         try:
-                            progress_callback(
-                                {
-                                    "index": index,
-                                    "total": len(normalized_ids),
-                                    "aweme_id": aweme_id,
-                                    "status": progress_status,
-                                    "status_code": status_code,
-                                    "status_msg": response.get("status_msg") or "",
-                                }
+                            await page.goto(
+                                target_url,
+                                wait_until="domcontentloaded",
+                                timeout=timeout_ms,
                             )
                         except Exception as exc:
-                            logger.debug("Like cleanup progress callback failed: %s", exc)
+                            logger.warning(
+                                "Reload like page between batch operations failed: %s",
+                                exc,
+                            )
 
-                    if (
-                        index < len(normalized_ids)
-                        and int(request_interval_ms or 0) > 0
-                    ):
+                    if has_more_batches and int(request_interval_ms or 0) > 0:
                         try:
                             await page.wait_for_timeout(int(request_interval_ms))
                         except Exception as exc:
                             logger.warning(
-                                "Like cleanup interrupted while waiting next request: %s",
+                                "Like cleanup interrupted while waiting next batch: %s",
                                 exc,
                             )
-                            result["failed_ids"].extend(normalized_ids[index:])
+                            result["failed_ids"].extend(
+                                normalized_ids[batch_start + len(batch_ids) :]
+                            )
                             break
             finally:
                 try:
@@ -1433,7 +1657,7 @@ async ({ aweme_id, type_value }) => {
             logger.debug("Reset like list scroll position failed: %s", exc)
 
         stagnant_rounds = 0
-        for _ in range(24):
+        for _ in range(120):
             try:
                 if await link.count() > 0:
                     return link
@@ -1445,6 +1669,10 @@ async ({ aweme_id, type_value }) => {
                 await scroller.evaluate("(el) => { el.scrollBy(0, 1600); }")
                 await page.wait_for_timeout(800)
                 current_top = await scroller.evaluate("(el) => el.scrollTop")
+                if abs(float(current_top) - float(previous_top)) < 1:
+                    await page.mouse.wheel(0, 1600)
+                    await page.wait_for_timeout(800)
+                    current_top = await scroller.evaluate("(el) => el.scrollTop")
             except Exception as exc:
                 logger.debug("Scroll like list failed while finding aweme %s: %s", aweme_id, exc)
                 return None
@@ -1453,7 +1681,7 @@ async ({ aweme_id, type_value }) => {
                 stagnant_rounds += 1
             else:
                 stagnant_rounds = 0
-            if stagnant_rounds >= 3:
+            if stagnant_rounds >= 8:
                 break
 
         try:
@@ -1463,57 +1691,89 @@ async ({ aweme_id, type_value }) => {
             pass
         return None
 
-    async def _cancel_like_via_bulk_manage(self, page, aweme_id: str) -> Dict[str, Any]:
+    async def _select_like_items_for_bulk_manage(
+        self, page, aweme_ids: List[str]
+    ) -> Dict[str, Any]:
+        item_responses: Dict[str, Dict[str, Any]] = {}
+        selected_ids: List[str] = []
+
         if not await self._page_ready_for_like_actions(page):
-            return {
+            response = {
                 "http_status": 200,
                 "status_code": 8,
                 "status_msg": "用户未登录",
                 "body": "",
             }
+            for aweme_id in aweme_ids:
+                item_responses[str(aweme_id or "")] = dict(response)
+            return {
+                "selected_ids": selected_ids,
+                "item_responses": item_responses,
+            }
 
         if not await self._ensure_like_bulk_manage_mode(page):
-            return {
+            response = {
                 "http_status": 0,
                 "status_code": 5,
                 "status_msg": "bulk_manage_unavailable",
                 "body": "",
             }
-
-        link = await self._find_like_item_link(page, aweme_id)
-        if link is None:
+            for aweme_id in aweme_ids:
+                item_responses[str(aweme_id or "")] = dict(response)
             return {
-                "http_status": 200,
-                "status_code": 4,
-                "status_msg": "aweme_not_found_in_like_list",
-                "body": "",
+                "selected_ids": selected_ids,
+                "item_responses": item_responses,
             }
 
-        try:
-            await link.scroll_into_view_if_needed(timeout=10_000)
-        except Exception:
-            pass
-
-        item = link.locator("xpath=ancestor::li[1]")
-        checkbox = item.locator("input.semi-checkbox-input").first
-        try:
-            if await checkbox.count() == 0:
-                return {
-                    "http_status": 0,
-                    "status_code": 5,
-                    "status_msg": "bulk_checkbox_unavailable",
+        for aweme_id in aweme_ids:
+            aweme_id_str = str(aweme_id or "").strip()
+            link = await self._find_like_item_link(page, aweme_id_str)
+            if link is None:
+                item_responses[aweme_id_str] = {
+                    "http_status": 200,
+                    "status_code": 4,
+                    "status_msg": "aweme_not_found_in_like_list",
                     "body": "",
                 }
-            await checkbox.check(force=True, timeout=10_000)
-            await page.wait_for_timeout(500)
-        except Exception as exc:
-            return {
-                "http_status": 0,
-                "status_code": 5,
-                "status_msg": f"bulk_checkbox_failed:{exc}",
-                "body": "",
-            }
+                continue
 
+            try:
+                await link.scroll_into_view_if_needed(timeout=10_000)
+            except Exception:
+                pass
+
+            item = link.locator("xpath=ancestor::li[1]")
+            checkbox = item.locator("input.semi-checkbox-input").first
+            try:
+                if await checkbox.count() == 0:
+                    item_responses[aweme_id_str] = {
+                        "http_status": 0,
+                        "status_code": 5,
+                        "status_msg": "bulk_checkbox_unavailable",
+                        "body": "",
+                    }
+                    continue
+                await checkbox.check(force=True, timeout=10_000)
+                await page.wait_for_timeout(300)
+            except Exception as exc:
+                item_responses[aweme_id_str] = {
+                    "http_status": 0,
+                    "status_code": 5,
+                    "status_msg": f"bulk_checkbox_failed:{exc}",
+                    "body": "",
+                }
+                continue
+
+            selected_ids.append(aweme_id_str)
+
+        return {
+            "selected_ids": selected_ids,
+            "item_responses": item_responses,
+        }
+
+    async def _submit_like_bulk_unlike(
+        self, page, verify_aweme_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         cancel_button = page.get_by_text("取消喜欢", exact=True)
         try:
             await cancel_button.click(timeout=10_000)
@@ -1536,16 +1796,25 @@ async ({ aweme_id, type_value }) => {
                 "body": "",
             }
 
+        if not verify_aweme_id:
+            return {
+                "http_status": 200,
+                "status_code": 0,
+                "status_msg": "",
+                "body": "",
+            }
+
         for _ in range(12):
-            try:
-                if await link.count() == 0:
-                    return {
-                        "http_status": 200,
-                        "status_code": 0,
-                        "status_msg": "",
-                        "body": "",
-                    }
-            except Exception:
+            if not await self._page_ready_for_like_actions(page):
+                return {
+                    "http_status": 200,
+                    "status_code": 8,
+                    "status_msg": "用户未登录",
+                    "body": "",
+                }
+
+            link = await self._find_like_item_link(page, verify_aweme_id)
+            if link is None:
                 return {
                     "http_status": 200,
                     "status_code": 0,
@@ -1554,13 +1823,24 @@ async ({ aweme_id, type_value }) => {
                 }
             await page.wait_for_timeout(500)
 
-        if not await self._page_ready_for_like_actions(page):
-            return {
-                "http_status": 200,
-                "status_code": 8,
-                "status_msg": "用户未登录",
-                "body": "",
-            }
+        try:
+            await page.goto(
+                f"{self.BASE_URL}/user/self?showTab=like",
+                wait_until="domcontentloaded",
+                timeout=15_000,
+            )
+        except Exception as exc:
+            logger.debug("Reload like page for bulk unlike verification failed: %s", exc)
+        else:
+            if await self._page_ready_for_like_actions(page):
+                link = await self._find_like_item_link(page, verify_aweme_id)
+                if link is None:
+                    return {
+                        "http_status": 200,
+                        "status_code": 0,
+                        "status_msg": "",
+                        "body": "",
+                    }
 
         return {
             "http_status": 200,
@@ -1568,6 +1848,46 @@ async ({ aweme_id, type_value }) => {
             "status_msg": "bulk_unlike_not_confirmed",
             "body": "",
         }
+
+    async def _cancel_like_batch_via_bulk_manage(
+        self, page, aweme_ids: List[str]
+    ) -> Dict[str, Any]:
+        selection = await self._select_like_items_for_bulk_manage(page, aweme_ids)
+        selected_ids = list(selection.get("selected_ids") or [])
+        item_responses = dict(selection.get("item_responses") or {})
+
+        if not selected_ids:
+            batch_response = item_responses.get(str(aweme_ids[0] or ""), {})
+            return {
+                "selected_ids": selected_ids,
+                "item_responses": item_responses,
+                "batch_response": batch_response,
+            }
+
+        batch_response = await self._submit_like_bulk_unlike(
+            page, verify_aweme_id=selected_ids[0]
+        )
+        for aweme_id in selected_ids:
+            item_responses[aweme_id] = dict(batch_response)
+
+        return {
+            "selected_ids": selected_ids,
+            "item_responses": item_responses,
+            "batch_response": batch_response,
+        }
+
+    async def _cancel_like_via_bulk_manage(self, page, aweme_id: str) -> Dict[str, Any]:
+        result = await self._cancel_like_batch_via_bulk_manage(page, [aweme_id])
+        item_responses = result.get("item_responses") or {}
+        return item_responses.get(
+            str(aweme_id or "").strip(),
+            {
+                "http_status": 0,
+                "status_code": 5,
+                "status_msg": "bulk_unlike_unknown",
+                "body": "",
+            },
+        )
 
     async def _commit_digg_via_signed_request(
         self, aweme_id: str, *, type_value: int
