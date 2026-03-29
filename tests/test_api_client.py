@@ -385,7 +385,116 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
     assert result["success_ids"] == ["111"]
     assert chromium.persistent_calls[0]["user_data_dir"] == str(profile_dir)
     assert profile_dir.exists() is True
+    assert context.added_cookies == []
     assert page.evaluate_payloads == [{"aweme_id": "111", "type_value": 0}]
+
+
+def test_cancel_likes_via_browser_fails_fast_when_login_ui_still_visible(
+    monkeypatch,
+):
+    class _FakePage:
+        def __init__(self):
+            self.context = None
+
+        async def goto(self, *args, **kwargs):
+            return
+
+        async def title(self):
+            return "抖音"
+
+        def is_closed(self):
+            return False
+
+        async def wait_for_timeout(self, _ms):
+            return
+
+        async def evaluate(self, _script, payload=None):
+            if payload is None:
+                return True
+            raise AssertionError("commit request should not run while login UI is visible")
+
+    class _FakeContext:
+        def __init__(self, page):
+            self._page = page
+            self._page.context = self
+            self.pages = [page]
+
+        async def add_cookies(self, _cookies):
+            return
+
+        async def new_page(self):
+            return self._page
+
+        async def cookies(self, _base_url):
+            return [{"name": "sessionid", "value": "sess", "domain": ".douyin.com"}]
+
+        async def close(self):
+            return
+
+    class _FakeBrowser:
+        def __init__(self, context):
+            self._context = context
+
+        async def new_context(self, **_kwargs):
+            return self._context
+
+        async def close(self):
+            return
+
+    class _FakeChromium:
+        def __init__(self, context):
+            self._context = context
+
+        async def launch(self, **_kwargs):
+            return _FakeBrowser(self._context)
+
+    class _FakePlaywright:
+        def __init__(self, chromium):
+            self.chromium = chromium
+
+    class _FakePlaywrightManager:
+        def __init__(self, playwright):
+            self._playwright = playwright
+
+        async def __aenter__(self):
+            return self._playwright
+
+        async def __aexit__(self, *_args):
+            return
+
+    page = _FakePage()
+    context = _FakeContext(page)
+    chromium = _FakeChromium(context)
+    playwright = _FakePlaywright(chromium)
+    manager = _FakePlaywrightManager(playwright)
+
+    fake_playwright_pkg = types.ModuleType("playwright")
+    fake_async_api = types.ModuleType("playwright.async_api")
+    fake_async_api.async_playwright = lambda: manager
+    monkeypatch.setitem(sys.modules, "playwright", fake_playwright_pkg)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", fake_async_api)
+
+    client = DouyinAPIClient({"sessionid": "sess", "sid_tt": "sid-tt"})
+    prompts = []
+
+    async def _fake_wait_for_manual_login(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(client, "_wait_for_manual_login", _fake_wait_for_manual_login)
+
+    result = asyncio.run(
+        client.cancel_likes_via_browser(
+            ["111"],
+            headless=False,
+            wait_timeout_seconds=60,
+            request_interval_ms=10,
+            login_confirmation_callback=lambda message: prompts.append(message),
+        )
+    )
+
+    assert result["success_ids"] == []
+    assert result["failed_ids"] == ["111"]
+    assert len(prompts) == 1
 
 
 @pytest.mark.asyncio

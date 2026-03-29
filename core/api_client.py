@@ -782,7 +782,7 @@ class DouyinAPIClient:
                                 "Reload like page after verification failed: %s", exc
                             )
 
-                if not headless and not await self._page_has_login_cookies(page):
+                if not headless and not await self._page_ready_for_like_actions(page):
                     if callable(progress_callback):
                         try:
                             progress_callback(
@@ -808,6 +808,15 @@ class DouyinAPIClient:
                                 "Like cleanup login confirmation callback failed: %s",
                                 exc,
                             )
+                    login_ready = await self._wait_for_manual_login(
+                        page, wait_timeout_seconds=wait_timeout_seconds
+                    )
+                    if not login_ready:
+                        logger.warning(
+                            "手动登录后页面仍未进入已登录状态，终止取消点赞。"
+                        )
+                        result["failed_ids"] = list(normalized_ids)
+                        return self._finalize_like_cleanup_result(result)
 
                 for index, aweme_id in enumerate(normalized_ids, start=1):
                     if page.is_closed():
@@ -834,6 +843,7 @@ class DouyinAPIClient:
                         logger.warning(
                             "取消点赞返回未登录，请在浏览器中完成登录，程序会自动重试。"
                         )
+                        login_ready = False
                         if callable(login_confirmation_callback):
                             try:
                                 maybe_awaitable = login_confirmation_callback(
@@ -846,10 +856,15 @@ class DouyinAPIClient:
                                     "Like cleanup login confirmation callback failed: %s",
                                     exc,
                                 )
-                        else:
-                            await self._wait_for_manual_login(
-                                page, wait_timeout_seconds=wait_timeout_seconds
+                        login_ready = await self._wait_for_manual_login(
+                            page, wait_timeout_seconds=wait_timeout_seconds
+                        )
+                        if not login_ready:
+                            logger.warning(
+                                "手动登录后页面仍未进入已登录状态，停止后续取消点赞。"
                             )
+                            result["failed_ids"].extend(normalized_ids[index - 1 :])
+                            break
                         if not page.is_closed():
                             try:
                                 await page.goto(
@@ -988,14 +1003,19 @@ class DouyinAPIClient:
             )
             context = await browser.new_context(**context_kwargs)
 
-        cookies = self._browser_cookie_payload(
-            include_sensitive=include_sensitive_cookies
-        )
-        if cookies:
-            try:
-                await context.add_cookies(cookies)
-            except Exception as exc:
-                logger.debug("Seed browser cookies skipped: %s", exc)
+        # For a persistent Playwright profile, prefer the browser's own stored
+        # session state. Re-seeding cookies from config can overwrite a fresher
+        # login captured in the profile and bounce the page back to login.
+        should_seed_cookies = not normalized_profile_dir
+        if should_seed_cookies:
+            cookies = self._browser_cookie_payload(
+                include_sensitive=include_sensitive_cookies
+            )
+            if cookies:
+                try:
+                    await context.add_cookies(cookies)
+                except Exception as exc:
+                    logger.debug("Seed browser cookies skipped: %s", exc)
 
         return context, browser
 
@@ -1066,23 +1086,29 @@ class DouyinAPIClient:
 
     async def _wait_for_manual_login(
         self, page, *, wait_timeout_seconds: int
-    ) -> None:
+    ) -> bool:
         deadline = asyncio.get_running_loop().time() + max(
             30, int(wait_timeout_seconds)
         )
         while asyncio.get_running_loop().time() < deadline:
             if page.is_closed():
                 logger.warning("Browser page closed while waiting manual login")
-                return
-            if await self._page_has_login_cookies(page):
-                logger.warning("检测到浏览器登录态，继续执行取消点赞。")
-                return
+                return False
+            if await self._page_ready_for_like_actions(page):
+                logger.warning("检测到浏览器已登录页面，继续执行取消点赞。")
+                return True
             await page.wait_for_timeout(1000)
 
         logger.warning(
-            "等待手动登录超时（%ss），继续按当前页面状态尝试取消点赞。",
+            "等待手动登录超时（%ss），页面仍未进入已登录状态。",
             wait_timeout_seconds,
         )
+        return False
+
+    async def _page_ready_for_like_actions(self, page) -> bool:
+        return await self._page_has_login_cookies(
+            page
+        ) and not await self._page_shows_login_gate(page)
 
     async def _page_has_login_cookies(self, page) -> bool:
         context = getattr(page, "context", None)
@@ -1110,6 +1136,36 @@ class DouyinAPIClient:
                 "uid_tt_ss",
             }
         )
+
+    async def _page_shows_login_gate(self, page) -> bool:
+        script = """
+() => {
+  const bodyText = (document.body && document.body.innerText) || "";
+  const markers = [
+    "登录后即可观看喜欢、收藏的视频",
+    "扫码登录",
+    "验证码登录",
+    "密码登录",
+    "请先登录",
+  ];
+  if (markers.some((marker) => bodyText.includes(marker))) {
+    return true;
+  }
+
+  const nodes = document.querySelectorAll("button, a, div, span");
+  for (const node of nodes) {
+    const text = (node.innerText || node.textContent || "").trim();
+    if (text === "登录") {
+      return true;
+    }
+  }
+  return false;
+}
+"""
+        try:
+            return bool(await page.evaluate(script))
+        except Exception:
+            return False
 
     async def _commit_digg_via_page(
         self, page, aweme_id: str, *, type_value: int
