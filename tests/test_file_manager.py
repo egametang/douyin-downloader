@@ -54,6 +54,13 @@ def test_get_save_path_flattens_to_base_path_when_folderstyle_disabled(tmp_path)
     assert path.exists()
 
 
+def test_file_manager_expands_user_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    fm = FileManager("~/Downloads/douyin")
+    assert fm.base_path == tmp_path / "Downloads" / "douyin"
+    assert fm.base_path.exists()
+
+
 @pytest.mark.asyncio
 async def test_download_file_atomic_write(tmp_path):
     """Downloaded file should appear only after successful completion (atomic rename)."""

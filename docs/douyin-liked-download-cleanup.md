@@ -11,6 +11,8 @@
 link:
   - https://www.douyin.com/user/<sec_uid>
 
+path: ~/Downloads/douyin/
+
 mode:
   - like
 

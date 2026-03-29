@@ -100,7 +100,7 @@ docker run -v $(pwd)/config.yml:/app/config.yml -v $(pwd)/Downloaded:/app/Downlo
 link:
   - https://www.douyin.com/user/MS4wLjABAAAAxxxx
 
-path: ./Downloaded/
+path: ~/Downloads/douyin/
 mode:
   - post
 
@@ -156,7 +156,7 @@ python run.py -c config.yml
 python run.py -c config.yml \
   -u "https://www.douyin.com/video/7604129988555574538" \
   -t 8 \
-  -p ./Downloaded
+  -p ~/Downloads/douyin
 ```
 
 ### Arguments
@@ -347,7 +347,7 @@ Default with `folderstyle: true` and `database_path: dy_downloader.db`:
 workspace/
 ├── config.yml
 ├── dy_downloader.db          # default location when database: true
-└── Downloaded/
+└── ~/Downloads/douyin/
     ├── download_manifest.jsonl
     └── AuthorName/
         ├── post/
@@ -379,7 +379,7 @@ The program uses a **database record + local file** dual check to decide whether
 
 ```bash
 # Delete local files (folder name contains the aweme_id)
-rm -rf Downloaded/AuthorName/post/*_<aweme_id>/
+rm -rf ~/Downloads/douyin/AuthorName/post/*_<aweme_id>/
 
 # Delete database record
 sqlite3 dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
@@ -388,14 +388,14 @@ sqlite3 dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
 ### Re-download all items from a specific author
 
 ```bash
-rm -rf Downloaded/AuthorName/
+rm -rf ~/Downloads/douyin/AuthorName/
 sqlite3 dy_downloader.db "DELETE FROM aweme WHERE author_name = 'AuthorName';"
 ```
 
 ### Full reset (re-download everything)
 
 ```bash
-rm -rf Downloaded/
+rm -rf ~/Downloads/douyin/
 rm dy_downloader.db
 ```
 

@@ -7,11 +7,11 @@ whisper_transcribe.py — 对 douyin-downloader 下载的视频进行 Whisper �
   # ffmpeg: conda install -c conda-forge ffmpeg  或放 ffmpeg.exe 到同目录
 
 用法:
-  python whisper_transcribe.py                          # 扫描 ./Downloaded/ 下所有mp4
-  python whisper_transcribe.py -d ./Downloaded/          # 指定目录
+  python whisper_transcribe.py                          # 扫描 ~/Downloads/douyin/ 下所有mp4
+  python whisper_transcribe.py -d ~/Downloads/douyin/   # 指定目录
   python whisper_transcribe.py -f video.mp4              # 单个文件
-  python whisper_transcribe.py -d ./Downloaded/ -m medium # 用medium模型
-  python whisper_transcribe.py -d ./Downloaded/ --srt     # 同时输出SRT
+  python whisper_transcribe.py -d ~/Downloads/douyin/ -m medium # 用medium模型
+  python whisper_transcribe.py -d ~/Downloads/douyin/ --srt     # 同时输出SRT
   python whisper_transcribe.py --skip-existing --sc       # 跳过已有 + 繁转简
 """
 import argparse
@@ -401,12 +401,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python whisper_transcribe.py -d ./Downloaded/\n"
+            "  python whisper_transcribe.py -d ~/Downloads/douyin/\n"
             "  python whisper_transcribe.py -f video.mp4 -m medium\n"
-            "  python whisper_transcribe.py -d ./Downloaded/ --srt --sc --skip-existing"
+            "  python whisper_transcribe.py -d ~/Downloads/douyin/ --srt --sc --skip-existing"
         ),
     )
-    parser.add_argument("-d", "--dir", default="./Downloaded", help="视频目录 (默认 ./Downloaded/)")
+    parser.add_argument("-d", "--dir", default="~/Downloads/douyin", help="视频目录 (默认 ~/Downloads/douyin/)")
     parser.add_argument("-f", "--file", help="单个视频文件")
     parser.add_argument("-m", "--model", default="base",
                         choices=["tiny", "base", "small", "medium", "large"],

@@ -19,8 +19,8 @@ class FileManager:
         "image/webp": ".webp",
     }
 
-    def __init__(self, base_path: str = "./Downloaded"):
-        self.base_path = Path(base_path)
+    def __init__(self, base_path: str = "~/Downloads/douyin"):
+        self.base_path = Path(base_path).expanduser()
         self.base_path.mkdir(parents=True, exist_ok=True)
 
     def get_save_path(

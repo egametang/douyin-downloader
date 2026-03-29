@@ -92,7 +92,7 @@ docker run -v $(pwd)/config.yml:/app/config.yml -v $(pwd)/Downloaded:/app/Downlo
 link:
   - https://www.douyin.com/user/MS4wLjABAAAAxxxx
 
-path: ./Downloaded/
+path: ~/Downloads/douyin/
 mode:
   - post
 
@@ -148,7 +148,7 @@ python run.py -c config.yml
 python run.py -c config.yml \
   -u "https://www.douyin.com/video/7604129988555574538" \
   -t 8 \
-  -p ./Downloaded
+  -p ~/Downloads/douyin
 ```
 
 ### 参数说明
@@ -339,7 +339,7 @@ pytest -q
 工作目录/
 ├── config.yml
 ├── dy_downloader.db          # database: true 时默认生成在这里
-└── Downloaded/
+└── ~/Downloads/douyin/
     ├── download_manifest.jsonl
     └── 作者名/
         ├── post/
@@ -371,7 +371,7 @@ pytest -q
 
 ```bash
 # 删除本地文件（文件名中包含 aweme_id）
-rm -rf Downloaded/作者名/post/*_<aweme_id>/
+rm -rf ~/Downloads/douyin/作者名/post/*_<aweme_id>/
 
 # 删除数据库记录
 sqlite3 dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
@@ -380,14 +380,14 @@ sqlite3 dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
 ### 重新下载某个作者的全部作品
 
 ```bash
-rm -rf Downloaded/作者名/
+rm -rf ~/Downloads/douyin/作者名/
 sqlite3 dy_downloader.db "DELETE FROM aweme WHERE author_name = '作者名';"
 ```
 
 ### 全部从零重新下载
 
 ```bash
-rm -rf Downloaded/
+rm -rf ~/Downloads/douyin/
 rm dy_downloader.db
 ```
 

@@ -55,7 +55,7 @@ dy-downloader/
 默认目录结构（`folderstyle: true`）：
 
 ```text
-Downloaded/
+~/Downloads/douyin/
 ├── download_manifest.jsonl
 └── 作者名/
     └── post/
