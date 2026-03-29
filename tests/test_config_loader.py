@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 from config import ConfigLoader
@@ -184,6 +185,38 @@ auto_cookie: false
     loader = ConfigLoader(str(config_file))
 
     assert loader.get_cookies() == {}
+
+
+def test_config_loader_database_path_defaults_under_download_path(tmp_path):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text(
+        """
+link:
+  - https://www.douyin.com/video/1
+path: ./Downloaded/
+database_path: dy_downloader.db
+"""
+    )
+
+    loader = ConfigLoader(str(config_file))
+
+    assert loader.get_database_path() == Path("./Downloaded/dy_downloader.db")
+
+
+def test_config_loader_database_path_keeps_explicit_custom_path(tmp_path):
+    config_file = tmp_path / "config.yml"
+    config_file.write_text(
+        """
+link:
+  - https://www.douyin.com/video/1
+path: ./Downloaded/
+database_path: ./data/custom.db
+"""
+    )
+
+    loader = ConfigLoader(str(config_file))
+
+    assert loader.get_database_path() == Path("./data/custom.db")
 
 
 def test_config_loader_warns_for_non_object_auto_cookie_file(

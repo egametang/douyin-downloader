@@ -88,7 +88,7 @@ dy-downloader/
 ### 4.3 SQLite 数据库（可开关）
 
 - 默认开关：`database: true`
-- 默认库文件：`dy_downloader.db`
+- 默认库文件：`~/Downloads/douyin/dy_downloader.db`
 - 表结构：
   - `aweme`：作品明细、作者、发布时间、下载时间、保存路径、原始 metadata
   - `download_history`：每次任务 URL、类型、总数、成功数、配置快照

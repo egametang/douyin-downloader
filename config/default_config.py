@@ -1,7 +1,10 @@
 from typing import Any, Dict
 
+DEFAULT_DOWNLOAD_PATH = "~/Downloads/douyin/"
+DEFAULT_DATABASE_FILENAME = "dy_downloader.db"
+
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "path": "~/Downloads/douyin/",
+    "path": DEFAULT_DOWNLOAD_PATH,
     "music": True,
     "cover": True,
     "avatar": True,
@@ -31,7 +34,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "rate_limit": 2,
     "proxy": "",
     "database": True,
-    "database_path": "dy_downloader.db",
+    "database_path": DEFAULT_DATABASE_FILENAME,
     "progress": {
         "quiet_logs": True,
     },

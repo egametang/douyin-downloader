@@ -164,7 +164,7 @@ async def main_async(args):
 
     database = None
     if config.get('database'):
-        db_path = config.get('database_path', 'dy_downloader.db') or 'dy_downloader.db'
+        db_path = config.get_database_path()
         database = Database(db_path=str(db_path))
         await database.initialize()
         display.print_success("Database initialized")

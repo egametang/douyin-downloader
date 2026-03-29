@@ -1,11 +1,13 @@
 import asyncio
-import aiosqlite
-from typing import Dict, Any, Optional
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import aiosqlite
 
 
 class Database:
-    def __init__(self, db_path: str = 'dy_downloader.db'):
+    def __init__(self, db_path: str = '~/Downloads/douyin/dy_downloader.db'):
         self.db_path = db_path
         self._initialized = False
         self._conn: Optional[aiosqlite.Connection] = None
@@ -15,6 +17,9 @@ class Database:
         if self._conn is None:
             async with self._conn_lock:
                 if self._conn is None:
+                    normalized_db_path = Path(self.db_path).expanduser()
+                    normalized_db_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.db_path = str(normalized_db_path)
                     self._conn = await aiosqlite.connect(self.db_path)
         return self._conn
 

@@ -8,7 +8,10 @@ from typing import Any, Dict, List, Optional
 import yaml
 from utils.cookie_utils import parse_cookie_header, sanitize_cookies
 
-from .default_config import DEFAULT_CONFIG
+from .default_config import (
+    DEFAULT_CONFIG,
+    DEFAULT_DATABASE_FILENAME,
+)
 
 logger = logging.getLogger("ConfigLoader")
 
@@ -162,6 +165,18 @@ class ConfigLoader:
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.config.get(key, default)
+
+    def get_download_path(self) -> Path:
+        raw_path = str(self.config.get("path") or DEFAULT_CONFIG["path"]).strip()
+        return Path(raw_path).expanduser()
+
+    def get_database_path(self) -> Path:
+        raw_db_path = str(
+            self.config.get("database_path", DEFAULT_DATABASE_FILENAME) or ""
+        ).strip()
+        if not raw_db_path or raw_db_path == DEFAULT_DATABASE_FILENAME:
+            return self.get_download_path() / DEFAULT_DATABASE_FILENAME
+        return Path(raw_db_path).expanduser()
 
     def get_cookies(self) -> Dict[str, str]:
         cookies_config = self.config.get("cookies") or self.config.get("cookie")

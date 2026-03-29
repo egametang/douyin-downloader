@@ -36,7 +36,7 @@ thread: 5
 retry_times: 3
 proxy: ""
 database: true
-database_path: dy_downloader.db
+database_path: ~/Downloads/douyin/dy_downloader.db
 
 progress:
   quiet_logs: true

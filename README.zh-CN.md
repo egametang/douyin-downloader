@@ -105,7 +105,7 @@ thread: 5
 retry_times: 3
 proxy: ""
 database: true
-database_path: dy_downloader.db
+database_path: ~/Downloads/douyin/dy_downloader.db
 
 progress:
   quiet_logs: true
@@ -327,19 +327,19 @@ pytest -q
 | `transcript.*` | 视频下载后的可选转写 |
 | `proxy` | 为 API 请求和媒体下载设置 HTTP/HTTPS 代理，例如 `http://127.0.0.1:7890` |
 | `database` | 启用 SQLite 去重和历史记录 |
-| `database_path` | SQLite 文件路径，默认在当前工作目录生成 `dy_downloader.db` |
+| `database_path` | SQLite 文件路径，默认生成在 `<path>/dy_downloader.db` |
 | `thread` | 并发下载数 |
 | `retry_times` | 失败重试次数 |
 
 ## 输出目录
 
-默认 `folderstyle: true` 且 `database_path: dy_downloader.db` 时：
+默认 `folderstyle: true` 且 `database_path: ~/Downloads/douyin/dy_downloader.db` 时：
 
 ```text
 工作目录/
 ├── config.yml
-├── dy_downloader.db          # database: true 时默认生成在这里
 └── ~/Downloads/douyin/
+    ├── dy_downloader.db      # database: true 时默认生成在这里
     ├── download_manifest.jsonl
     └── 作者名/
         ├── post/
@@ -374,21 +374,21 @@ pytest -q
 rm -rf ~/Downloads/douyin/作者名/post/*_<aweme_id>/
 
 # 删除数据库记录
-sqlite3 dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
+sqlite3 ~/Downloads/douyin/dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
 ```
 
 ### 重新下载某个作者的全部作品
 
 ```bash
 rm -rf ~/Downloads/douyin/作者名/
-sqlite3 dy_downloader.db "DELETE FROM aweme WHERE author_name = '作者名';"
+sqlite3 ~/Downloads/douyin/dy_downloader.db "DELETE FROM aweme WHERE author_name = '作者名';"
 ```
 
 ### 全部从零重新下载
 
 ```bash
 rm -rf ~/Downloads/douyin/
-rm dy_downloader.db
+rm ~/Downloads/douyin/dy_downloader.db
 ```
 
 > **注意：** 只删数据库不删文件不会触发重新下载——程序会扫描本地文件名中的 aweme_id 进行去重。只删文件不删数据库会触发重新下载（数据库中有记录但文件不存在时视为需要重新下载）。
@@ -428,7 +428,7 @@ python -m tools.cookie_fetcher --config config.yml
 ### 5) 如何查看下载历史？
 
 ```bash
-sqlite3 dy_downloader.db "SELECT aweme_id, title, author_name, datetime(download_time, 'unixepoch', 'localtime') FROM aweme ORDER BY download_time DESC LIMIT 20;"
+sqlite3 ~/Downloads/douyin/dy_downloader.db "SELECT aweme_id, title, author_name, datetime(download_time, 'unixepoch', 'localtime') FROM aweme ORDER BY download_time DESC LIMIT 20;"
 ```
 
 ## 旧版切换（V1.0）

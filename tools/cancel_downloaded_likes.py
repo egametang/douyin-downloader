@@ -6,11 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from config import ConfigLoader
+from config import ConfigLoader, DEFAULT_DATABASE_FILENAME
 from core.api_client import DouyinAPIClient
 
 DEFAULT_CONFIG_PATH = Path("config.yml")
-DEFAULT_DB_PATH = Path("dy_downloader.db")
 DEFAULT_MANIFEST_PATH = Path("Downloaded/download_manifest.jsonl")
 DEFAULT_BATCH_SCOPE = "latest"
 DEFAULT_BATCH_GAP_SECONDS = 900
@@ -30,8 +29,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--db",
         type=Path,
-        default=DEFAULT_DB_PATH,
-        help=f"SQLite database path (default: {DEFAULT_DB_PATH})",
+        default=None,
+        help=(
+            "SQLite database path "
+            f"(default: <download_path>/{DEFAULT_DATABASE_FILENAME})"
+        ),
     )
     parser.add_argument(
         "--manifest",
@@ -227,6 +229,7 @@ async def main_async(args: argparse.Namespace) -> int:
         return 1
 
     config = ConfigLoader(str(args.config)) if args.config else ConfigLoader()
+    db_path = args.db if args.db is not None else config.get_database_path()
     cookies = config.get_cookies()
     if not cookies:
         print("[ERROR] No cookies found in config.", file=sys.stderr)
@@ -251,7 +254,7 @@ async def main_async(args: argparse.Namespace) -> int:
         explicit_aweme_ids
         if explicit_aweme_ids
         else collect_downloaded_aweme_ids(
-            args.db,
+            db_path,
             args.manifest,
             args.source,
             batch_scope=batch_scope,

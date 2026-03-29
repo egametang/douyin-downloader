@@ -113,7 +113,7 @@ thread: 5
 retry_times: 3
 proxy: ""
 database: true
-database_path: dy_downloader.db
+database_path: ~/Downloads/douyin/dy_downloader.db
 
 progress:
   quiet_logs: true
@@ -335,19 +335,19 @@ pytest -q
 | `transcript.*` | Optional transcription after video download |
 | `proxy` | HTTP/HTTPS proxy for API requests and media downloads, e.g. `http://127.0.0.1:7890` |
 | `database` | Enable SQLite deduplication and history |
-| `database_path` | SQLite path, default is `dy_downloader.db` in the current working directory |
+| `database_path` | SQLite path, default is `<path>/dy_downloader.db` |
 | `thread` | Concurrent download count |
 | `retry_times` | Retry count on failure |
 
 ## Output Structure
 
-Default with `folderstyle: true` and `database_path: dy_downloader.db`:
+Default with `folderstyle: true` and `database_path: ~/Downloads/douyin/dy_downloader.db`:
 
 ```text
 workspace/
 ├── config.yml
-├── dy_downloader.db          # default location when database: true
 └── ~/Downloads/douyin/
+    ├── dy_downloader.db      # default location when database: true
     ├── download_manifest.jsonl
     └── AuthorName/
         ├── post/
@@ -382,21 +382,21 @@ The program uses a **database record + local file** dual check to decide whether
 rm -rf ~/Downloads/douyin/AuthorName/post/*_<aweme_id>/
 
 # Delete database record
-sqlite3 dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
+sqlite3 ~/Downloads/douyin/dy_downloader.db "DELETE FROM aweme WHERE aweme_id = '<aweme_id>';"
 ```
 
 ### Re-download all items from a specific author
 
 ```bash
 rm -rf ~/Downloads/douyin/AuthorName/
-sqlite3 dy_downloader.db "DELETE FROM aweme WHERE author_name = 'AuthorName';"
+sqlite3 ~/Downloads/douyin/dy_downloader.db "DELETE FROM aweme WHERE author_name = 'AuthorName';"
 ```
 
 ### Full reset (re-download everything)
 
 ```bash
 rm -rf ~/Downloads/douyin/
-rm dy_downloader.db
+rm ~/Downloads/douyin/dy_downloader.db
 ```
 
 > **Note:** Deleting only the database but keeping files will NOT trigger re-download — the program scans local filenames for aweme_id to detect existing downloads. Deleting only files but keeping the database WILL trigger re-download (the program treats "in DB but missing locally" as needing retry).
@@ -436,7 +436,7 @@ Check in order:
 ### 5) How to view download history?
 
 ```bash
-sqlite3 dy_downloader.db "SELECT aweme_id, title, author_name, datetime(download_time, 'unixepoch', 'localtime') FROM aweme ORDER BY download_time DESC LIMIT 20;"
+sqlite3 ~/Downloads/douyin/dy_downloader.db "SELECT aweme_id, title, author_name, datetime(download_time, 'unixepoch', 'localtime') FROM aweme ORDER BY download_time DESC LIMIT 20;"
 ```
 
 ## Legacy Version (V1.0)
