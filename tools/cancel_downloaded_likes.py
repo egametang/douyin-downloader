@@ -12,6 +12,8 @@ from core.api_client import DouyinAPIClient
 DEFAULT_CONFIG_PATH = Path("config.yml")
 DEFAULT_DB_PATH = Path("dy_downloader.db")
 DEFAULT_MANIFEST_PATH = Path("Downloaded/download_manifest.jsonl")
+DEFAULT_BATCH_SCOPE = "latest"
+DEFAULT_BATCH_GAP_SECONDS = 900
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -42,6 +44,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         choices=["auto", "db", "manifest"],
         default="auto",
         help="Where to read aweme ids from (default: auto)",
+    )
+    parser.add_argument(
+        "--batch-scope",
+        choices=["latest", "all"],
+        default=DEFAULT_BATCH_SCOPE,
+        help="Which downloaded batch to unlike (default: latest)",
+    )
+    parser.add_argument(
+        "--batch-gap-seconds",
+        type=int,
+        default=DEFAULT_BATCH_GAP_SECONDS,
+        help=(
+            "Gap threshold used to split DB download batches when "
+            "--batch-scope=latest (default: 900)"
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -99,7 +116,33 @@ def dedupe_aweme_ids(aweme_ids: List[str]) -> List[str]:
     return normalized
 
 
-def collect_aweme_ids_from_db(db_path: Path) -> List[str]:
+def _select_latest_db_batch(
+    rows: List[tuple[str, int]], batch_gap_seconds: int
+) -> List[tuple[str, int]]:
+    if not rows:
+        return []
+
+    normalized_gap = max(1, int(batch_gap_seconds or 0))
+    batch_rows: List[tuple[str, int]] = []
+    previous_ts: Optional[int] = None
+    for aweme_id, download_time in rows:
+        aweme_id_str = str(aweme_id or "").strip()
+        download_ts = int(download_time or 0)
+        if not aweme_id_str or download_ts <= 0:
+            continue
+        if previous_ts is not None and previous_ts - download_ts > normalized_gap:
+            break
+        batch_rows.append((aweme_id_str, download_ts))
+        previous_ts = download_ts
+    return batch_rows
+
+
+def collect_aweme_ids_from_db(
+    db_path: Path,
+    *,
+    batch_scope: str = "all",
+    batch_gap_seconds: int = DEFAULT_BATCH_GAP_SECONDS,
+) -> List[str]:
     if not db_path.exists():
         return []
 
@@ -108,12 +151,20 @@ def collect_aweme_ids_from_db(db_path: Path) -> List[str]:
         cursor = conn.execute(
             """
             SELECT aweme_id
+                , download_time
             FROM aweme
             WHERE aweme_id IS NOT NULL AND aweme_id != ''
             ORDER BY download_time DESC, id DESC
             """
         )
-        return dedupe_aweme_ids([row[0] for row in cursor.fetchall() if row and row[0]])
+        rows = [
+            (str(row[0]), int(row[1] or 0))
+            for row in cursor.fetchall()
+            if row and row[0]
+        ]
+        if batch_scope == "latest":
+            rows = _select_latest_db_batch(rows, batch_gap_seconds=batch_gap_seconds)
+        return dedupe_aweme_ids([row[0] for row in rows if row and row[0]])
     finally:
         conn.close()
 
@@ -140,14 +191,31 @@ def collect_aweme_ids_from_manifest(manifest_path: Path) -> List[str]:
 
 
 def collect_downloaded_aweme_ids(
-    db_path: Path, manifest_path: Path, source: str = "auto"
+    db_path: Path,
+    manifest_path: Path,
+    source: str = "auto",
+    *,
+    batch_scope: str = DEFAULT_BATCH_SCOPE,
+    batch_gap_seconds: int = DEFAULT_BATCH_GAP_SECONDS,
 ) -> List[str]:
     if source == "db":
-        return collect_aweme_ids_from_db(db_path)
+        return collect_aweme_ids_from_db(
+            db_path,
+            batch_scope=batch_scope,
+            batch_gap_seconds=batch_gap_seconds,
+        )
     if source == "manifest":
         return collect_aweme_ids_from_manifest(manifest_path)
 
-    combined = collect_aweme_ids_from_db(db_path)
+    db_ids = collect_aweme_ids_from_db(
+        db_path,
+        batch_scope=batch_scope,
+        batch_gap_seconds=batch_gap_seconds,
+    )
+    if batch_scope == "latest" and db_ids:
+        return db_ids
+
+    combined = list(db_ids)
     if manifest_path.exists():
         combined.extend(collect_aweme_ids_from_manifest(manifest_path))
     return dedupe_aweme_ids(combined)
@@ -169,10 +237,26 @@ async def main_async(args: argparse.Namespace) -> int:
         cleanup_cfg = {"enabled": cleanup_cfg}
 
     explicit_aweme_ids = dedupe_aweme_ids(list(args.aweme_ids or []))
+    batch_scope = str(
+        cleanup_cfg.get("batch_scope", args.batch_scope) or args.batch_scope
+    ).strip() or DEFAULT_BATCH_SCOPE
+    if batch_scope not in {"latest", "all"}:
+        batch_scope = DEFAULT_BATCH_SCOPE
+    batch_gap_seconds = int(
+        cleanup_cfg.get("batch_gap_seconds", args.batch_gap_seconds)
+        if cleanup_cfg.get("batch_gap_seconds") is not None
+        else args.batch_gap_seconds
+    )
     aweme_ids = (
         explicit_aweme_ids
         if explicit_aweme_ids
-        else collect_downloaded_aweme_ids(args.db, args.manifest, args.source)
+        else collect_downloaded_aweme_ids(
+            args.db,
+            args.manifest,
+            args.source,
+            batch_scope=batch_scope,
+            batch_gap_seconds=batch_gap_seconds,
+        )
     )
     if args.limit and args.limit > 0:
         aweme_ids = aweme_ids[: args.limit]
@@ -202,7 +286,11 @@ async def main_async(args: argparse.Namespace) -> int:
         else cleanup_cfg.get("request_interval_ms", 1000) or 1000
     )
 
-    print(f"[INFO] Found {len(aweme_ids)} downloaded aweme id(s) to unlike.")
+    batch_label = "explicit selection" if explicit_aweme_ids else batch_scope
+    print(
+        f"[INFO] Found {len(aweme_ids)} downloaded aweme id(s) to unlike "
+        f"(batch_scope={batch_label})."
+    )
 
     def _on_progress(payload: Dict[str, Any]) -> None:
         event = str(payload.get("event") or "").strip()

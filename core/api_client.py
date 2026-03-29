@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -824,11 +826,21 @@ class DouyinAPIClient:
                         result["failed_ids"].extend(normalized_ids[index - 1 :])
                         break
 
-                    response = await self._commit_digg_via_page(
-                        page, aweme_id, type_value=0
-                    )
+                    try:
+                        browser_cookies = await context.cookies(self.BASE_URL)
+                        self._sync_browser_cookies(browser_cookies)
+                    except Exception as exc:
+                        logger.debug(
+                            "Sync browser cookies before like cleanup request failed: %s",
+                            exc,
+                        )
+
+                    response = await self._cancel_like_via_bulk_manage(page, aweme_id)
                     status_code = self._as_int(response.get("status_code"), default=-1)
-                    if status_code == 8 and not headless:
+                    needs_manual_reauth = status_code == 8 or self._as_int(
+                        response.get("http_status"), default=0
+                    ) == 403
+                    if needs_manual_reauth and not headless:
                         if callable(progress_callback):
                             try:
                                 progress_callback(
@@ -841,13 +853,13 @@ class DouyinAPIClient:
                             except Exception as exc:
                                 logger.debug("Like cleanup progress callback failed: %s", exc)
                         logger.warning(
-                            "取消点赞返回未登录，请在浏览器中完成登录，程序会自动重试。"
+                            "取消点赞返回未登录或请求被拒绝，请在浏览器中完成登录/验证，程序会自动重试。"
                         )
                         login_ready = False
                         if callable(login_confirmation_callback):
                             try:
                                 maybe_awaitable = login_confirmation_callback(
-                                    f"作品 {aweme_id} 取消点赞返回未登录。请先在浏览器完成登录，然后回到终端按 Enter 继续。"
+                                    f"作品 {aweme_id} 取消点赞请求需要重新登录或验证。请先在浏览器完成操作，然后回到终端按 Enter 继续。"
                                 )
                                 if asyncio.iscoroutine(maybe_awaitable):
                                     await maybe_awaitable
@@ -877,8 +889,16 @@ class DouyinAPIClient:
                                     "Reload like page after manual login failed: %s",
                                     exc,
                                 )
-                            response = await self._commit_digg_via_page(
-                                page, aweme_id, type_value=0
+                            try:
+                                browser_cookies = await context.cookies(self.BASE_URL)
+                                self._sync_browser_cookies(browser_cookies)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Sync browser cookies after manual login failed: %s",
+                                    exc,
+                                )
+                            response = await self._cancel_like_via_bulk_manage(
+                                page, aweme_id
                             )
                             status_code = self._as_int(
                                 response.get("status_code"), default=-1
@@ -966,6 +986,60 @@ class DouyinAPIClient:
             )
         return payload
 
+    async def _sync_context_cookies_from_client(
+        self,
+        context,
+        *,
+        include_sensitive: bool,
+        overwrite_existing: bool,
+    ) -> int:
+        payload = self._browser_cookie_payload(include_sensitive=include_sensitive)
+        if not payload:
+            return 0
+
+        existing: Dict[str, str] = {}
+        try:
+            current_cookies = await context.cookies(self.BASE_URL)
+        except Exception:
+            current_cookies = []
+
+        for cookie in current_cookies or []:
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").strip()
+            if not name:
+                continue
+            existing[name] = str(cookie.get("value") or "")
+
+        pending: List[Dict[str, str]] = []
+        for cookie in payload:
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "")
+            existing_value = existing.get(name)
+            if overwrite_existing:
+                if existing_value == value:
+                    continue
+            else:
+                if existing_value:
+                    continue
+            pending.append(cookie)
+
+        if not pending:
+            return 0
+
+        try:
+            await context.add_cookies(pending)
+        except Exception as exc:
+            logger.debug("Sync browser cookies from config skipped: %s", exc)
+            return 0
+
+        logger.warning(
+            "Synced %s cookie(s) from config into browser context%s",
+            len(pending),
+            " with overwrite" if overwrite_existing else "",
+        )
+        return len(pending)
+
     async def _create_browser_context(
         self,
         playwright,
@@ -979,8 +1053,7 @@ class DouyinAPIClient:
             "--disable-dev-shm-usage",
             "--no-sandbox",
         ]
-        context_kwargs = {
-            "user_agent": self.headers.get("User-Agent", ""),
+        base_context_kwargs = {
             "locale": "zh-CN",
             "viewport": {"width": 1600, "height": 900},
         }
@@ -994,20 +1067,29 @@ class DouyinAPIClient:
                 str(profile_path),
                 headless=headless,
                 args=launch_args,
-                **context_kwargs,
+                **base_context_kwargs,
             )
         else:
+            context_kwargs = {
+                **base_context_kwargs,
+                "user_agent": self.headers.get("User-Agent", ""),
+            }
             browser = await playwright.chromium.launch(
                 headless=headless,
                 args=launch_args,
             )
             context = await browser.new_context(**context_kwargs)
 
-        # For a persistent Playwright profile, prefer the browser's own stored
-        # session state. Re-seeding cookies from config can overwrite a fresher
-        # login captured in the profile and bounce the page back to login.
-        should_seed_cookies = not normalized_profile_dir
-        if should_seed_cookies:
+        # Persistent profiles can still miss non-persisted or recently refreshed
+        # cookies such as msToken. Backfill only missing entries from config so
+        # we preserve the profile's own login state while repairing gaps.
+        if normalized_profile_dir:
+            await self._sync_context_cookies_from_client(
+                context,
+                include_sensitive=include_sensitive_cookies,
+                overwrite_existing=False,
+            )
+        else:
             cookies = self._browser_cookie_payload(
                 include_sensitive=include_sensitive_cookies
             )
@@ -1090,6 +1172,7 @@ class DouyinAPIClient:
         deadline = asyncio.get_running_loop().time() + max(
             30, int(wait_timeout_seconds)
         )
+        reloaded_after_confirmation = False
         while asyncio.get_running_loop().time() < deadline:
             if page.is_closed():
                 logger.warning("Browser page closed while waiting manual login")
@@ -1097,6 +1180,23 @@ class DouyinAPIClient:
             if await self._page_ready_for_like_actions(page):
                 logger.warning("检测到浏览器已登录页面，继续执行取消点赞。")
                 return True
+            if not reloaded_after_confirmation:
+                reload_page = getattr(page, "reload", None)
+                if callable(reload_page):
+                    try:
+                        await reload_page(
+                            wait_until="domcontentloaded",
+                            timeout=10_000,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Reload page after manual login confirmation failed: %s",
+                            exc,
+                        )
+                    reloaded_after_confirmation = True
+                    if await self._page_ready_for_like_actions(page):
+                        logger.warning("刷新页面后检测到浏览器已登录，继续执行取消点赞。")
+                        return True
             await page.wait_for_timeout(1000)
 
         logger.warning(
@@ -1142,6 +1242,7 @@ class DouyinAPIClient:
 () => {
   const bodyText = (document.body && document.body.innerText) || "";
   const markers = [
+    "未登录",
     "登录后即可观看喜欢、收藏的视频",
     "扫码登录",
     "验证码登录",
@@ -1152,10 +1253,22 @@ class DouyinAPIClient:
     return true;
   }
 
-  const nodes = document.querySelectorAll("button, a, div, span");
-  for (const node of nodes) {
-    const text = (node.innerText || node.textContent || "").trim();
-    if (text === "登录") {
+  const isVisible = (node) => {
+    if (!(node instanceof Element)) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+
+  const authRoots = document.querySelectorAll(
+    '[role="dialog"], [class*="login"], [id*="login"], [data-e2e*="login"]'
+  );
+  for (const root of authRoots) {
+    if (!isVisible(root)) continue;
+    const text = (root.innerText || root.textContent || "").trim();
+    if (!text) continue;
+    if (text === "登录" || markers.some((marker) => text.includes(marker))) {
       return true;
     }
   }
@@ -1267,6 +1380,285 @@ async ({ aweme_id, type_value }) => {
                 "body": "",
             }
         return data if isinstance(data, dict) else {}
+
+    def _like_item_link_selector(self, aweme_id: str) -> str:
+        aweme_id_str = str(aweme_id or "").strip()
+        return (
+            f'a[href="/video/{aweme_id_str}"], '
+            f'a[href="https://www.douyin.com/video/{aweme_id_str}"], '
+            f'a[href="/note/{aweme_id_str}"], '
+            f'a[href="//www.douyin.com/note/{aweme_id_str}"], '
+            f'a[href="https://www.douyin.com/note/{aweme_id_str}"]'
+        )
+
+    async def _ensure_like_bulk_manage_mode(self, page) -> bool:
+        exit_manage = page.get_by_text("退出管理", exact=True)
+        try:
+            if await exit_manage.count() > 0:
+                return True
+        except Exception:
+            pass
+
+        manage_button = page.get_by_text("批量管理", exact=True)
+        for _ in range(10):
+            try:
+                if await manage_button.count() > 0:
+                    await manage_button.first.click(timeout=10_000)
+                    await page.wait_for_timeout(500)
+                    return await exit_manage.count() > 0
+            except Exception as exc:
+                logger.debug("Enter like bulk manage mode failed: %s", exc)
+            await page.wait_for_timeout(500)
+        return False
+
+    async def _find_like_item_link(self, page, aweme_id: str):
+        selector = self._like_item_link_selector(aweme_id)
+        link = page.locator(selector).first
+        try:
+            if await link.count() > 0:
+                return link
+        except Exception:
+            pass
+
+        scroller = page.locator(
+            "div.parent-route-container.route-scroll-container, "
+            "div.parent-route-container.XoIW2IMs.route-scroll-container"
+        ).first
+        try:
+            if await scroller.count() == 0:
+                return None
+            await scroller.evaluate("(el) => { el.scrollTo(0, 0); }")
+            await page.wait_for_timeout(500)
+        except Exception as exc:
+            logger.debug("Reset like list scroll position failed: %s", exc)
+
+        stagnant_rounds = 0
+        for _ in range(24):
+            try:
+                if await link.count() > 0:
+                    return link
+            except Exception:
+                pass
+
+            try:
+                previous_top = await scroller.evaluate("(el) => el.scrollTop")
+                await scroller.evaluate("(el) => { el.scrollBy(0, 1600); }")
+                await page.wait_for_timeout(800)
+                current_top = await scroller.evaluate("(el) => el.scrollTop")
+            except Exception as exc:
+                logger.debug("Scroll like list failed while finding aweme %s: %s", aweme_id, exc)
+                return None
+
+            if abs(float(current_top) - float(previous_top)) < 1:
+                stagnant_rounds += 1
+            else:
+                stagnant_rounds = 0
+            if stagnant_rounds >= 3:
+                break
+
+        try:
+            if await link.count() > 0:
+                return link
+        except Exception:
+            pass
+        return None
+
+    async def _cancel_like_via_bulk_manage(self, page, aweme_id: str) -> Dict[str, Any]:
+        if not await self._page_ready_for_like_actions(page):
+            return {
+                "http_status": 200,
+                "status_code": 8,
+                "status_msg": "用户未登录",
+                "body": "",
+            }
+
+        if not await self._ensure_like_bulk_manage_mode(page):
+            return {
+                "http_status": 0,
+                "status_code": 5,
+                "status_msg": "bulk_manage_unavailable",
+                "body": "",
+            }
+
+        link = await self._find_like_item_link(page, aweme_id)
+        if link is None:
+            return {
+                "http_status": 200,
+                "status_code": 4,
+                "status_msg": "aweme_not_found_in_like_list",
+                "body": "",
+            }
+
+        try:
+            await link.scroll_into_view_if_needed(timeout=10_000)
+        except Exception:
+            pass
+
+        item = link.locator("xpath=ancestor::li[1]")
+        checkbox = item.locator("input.semi-checkbox-input").first
+        try:
+            if await checkbox.count() == 0:
+                return {
+                    "http_status": 0,
+                    "status_code": 5,
+                    "status_msg": "bulk_checkbox_unavailable",
+                    "body": "",
+                }
+            await checkbox.check(force=True, timeout=10_000)
+            await page.wait_for_timeout(500)
+        except Exception as exc:
+            return {
+                "http_status": 0,
+                "status_code": 5,
+                "status_msg": f"bulk_checkbox_failed:{exc}",
+                "body": "",
+            }
+
+        cancel_button = page.get_by_text("取消喜欢", exact=True)
+        try:
+            await cancel_button.click(timeout=10_000)
+        except Exception as exc:
+            return {
+                "http_status": 0,
+                "status_code": 5,
+                "status_msg": f"bulk_cancel_click_failed:{exc}",
+                "body": "",
+            }
+
+        confirm_button = page.get_by_text("确认取消", exact=True)
+        try:
+            await confirm_button.click(timeout=10_000)
+        except Exception as exc:
+            return {
+                "http_status": 0,
+                "status_code": 5,
+                "status_msg": f"bulk_confirm_click_failed:{exc}",
+                "body": "",
+            }
+
+        for _ in range(12):
+            try:
+                if await link.count() == 0:
+                    return {
+                        "http_status": 200,
+                        "status_code": 0,
+                        "status_msg": "",
+                        "body": "",
+                    }
+            except Exception:
+                return {
+                    "http_status": 200,
+                    "status_code": 0,
+                    "status_msg": "",
+                    "body": "",
+                }
+            await page.wait_for_timeout(500)
+
+        if not await self._page_ready_for_like_actions(page):
+            return {
+                "http_status": 200,
+                "status_code": 8,
+                "status_msg": "用户未登录",
+                "body": "",
+            }
+
+        return {
+            "http_status": 200,
+            "status_code": 5,
+            "status_msg": "bulk_unlike_not_confirmed",
+            "body": "",
+        }
+
+    async def _commit_digg_via_signed_request(
+        self, aweme_id: str, *, type_value: int
+    ) -> Dict[str, Any]:
+        params = await self._default_query()
+        params.update(
+            {
+                "aweme_id": str(aweme_id or ""),
+                "item_type": "0",
+                "type": str(type_value or 0),
+            }
+        )
+        signed_url, ua = self.build_signed_path(
+            "/aweme/v1/web/commit/item/digg/", params
+        )
+        csrf_token = (
+            (self.cookies.get("passport_csrf_token") or "").strip()
+            or (self.cookies.get("passport_csrf_token_default") or "").strip()
+        )
+        headers = {
+            **self.headers,
+            "User-Agent": ua,
+            "Referer": f"{self.BASE_URL}/user/self?showTab=like",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "x-secsdk-csrf-request": "1",
+            "x-requested-with": "XMLHttpRequest",
+        }
+        if csrf_token:
+            headers["x-secsdk-csrf-token"] = csrf_token
+            headers["x-tt-passport-csrf-token"] = csrf_token
+        ree_public_key = self._decode_guard_public_key()
+        if ree_public_key:
+            headers["bd-ticket-guard-ree-public-key"] = ree_public_key
+
+        payload = {
+            "aweme_id": str(aweme_id or ""),
+            "item_type": "0",
+            "type": str(type_value or 0),
+        }
+
+        try:
+            session = await self.get_session()
+            async with session.post(
+                signed_url,
+                headers=headers,
+                data=payload,
+                proxy=self.proxy or None,
+            ) as response:
+                text = await response.text()
+        except Exception as exc:
+            return {
+                "http_status": 0,
+                "status_code": None,
+                "status_msg": str(exc),
+                "body": "",
+            }
+
+        data: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+
+        return {
+            "http_status": response.status,
+            "status_code": (
+                data.get("status_code")
+                if isinstance(data.get("status_code"), int)
+                else data.get("status_code")
+            ),
+            "status_msg": str(data.get("status_msg") or ""),
+            "body": text[:500],
+        }
+
+    def _decode_guard_public_key(self) -> str:
+        raw = str(self.cookies.get("bd_ticket_guard_client_data_v2") or "").strip()
+        if not raw:
+            return ""
+        try:
+            normalized = raw.replace("-", "+").replace("_", "/")
+            padding = "=" * ((4 - (len(normalized) % 4)) % 4)
+            decoded = base64.b64decode(normalized + padding).decode("utf-8")
+            payload = json.loads(decoded)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("ree_public_key") or "").strip()
 
     @staticmethod
     def _normalize_aweme_ids(aweme_ids: List[str]) -> List[str]:

@@ -46,6 +46,72 @@ def test_build_signed_path_prefers_abogus(monkeypatch):
     assert "a_bogus=fake_ab" in signed_url
 
 
+def test_commit_digg_via_signed_request_uses_signed_post(monkeypatch):
+    class _FakeResponse:
+        def __init__(self):
+            self.status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return
+
+        async def text(self):
+            return '{"status_code":0,"status_msg":""}'
+
+    class _FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, *, headers=None, data=None, proxy=None):
+            self.calls.append(
+                {
+                    "url": url,
+                    "headers": dict(headers or {}),
+                    "data": dict(data or {}),
+                    "proxy": proxy,
+                }
+            )
+            return _FakeResponse()
+
+    client = DouyinAPIClient(
+        {
+            "msToken": "token-1",
+            "passport_csrf_token": "csrf-1",
+        }
+    )
+    fake_session = _FakeSession()
+
+    async def _fake_default_query():
+        return {"aid": "6383", "msToken": "token-1"}
+
+    async def _fake_get_session():
+        return fake_session
+
+    monkeypatch.setattr(client, "_default_query", _fake_default_query)
+    monkeypatch.setattr(client, "get_session", _fake_get_session)
+    monkeypatch.setattr(
+        client,
+        "build_signed_path",
+        lambda path, params: ("https://www.douyin.com/signed-digg", "UA-1"),
+    )
+
+    result = asyncio.run(
+        client._commit_digg_via_signed_request("111", type_value=0)
+    )
+
+    assert result["status_code"] == 0
+    assert fake_session.calls[0]["url"] == "https://www.douyin.com/signed-digg"
+    assert fake_session.calls[0]["data"] == {
+        "aweme_id": "111",
+        "item_type": "0",
+        "type": "0",
+    }
+    assert fake_session.calls[0]["headers"]["User-Agent"] == "UA-1"
+    assert fake_session.calls[0]["headers"]["x-secsdk-csrf-token"] == "csrf-1"
+
+
 def test_browser_fallback_caps_warmup_wait(monkeypatch):
     class _FakeMouse:
         async def wheel(self, _x, _y):
@@ -164,7 +230,6 @@ def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
     class _FakePage:
         def __init__(self):
             self.context = None
-            self.evaluate_payloads = []
             self.goto_calls = []
             self.wait_calls = 0
 
@@ -180,17 +245,6 @@ def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
 
         async def wait_for_timeout(self, _ms):
             self.wait_calls += 1
-
-        async def evaluate(self, _script, payload):
-            self.evaluate_payloads.append(dict(payload))
-            aweme_id = payload.get("aweme_id")
-            if aweme_id == "111":
-                return {"http_status": 200, "status_code": 0, "status_msg": ""}
-            return {
-                "http_status": 200,
-                "status_code": 5,
-                "status_msg": "failed",
-            }
 
     class _FakeContext:
         def __init__(self, page):
@@ -258,6 +312,20 @@ def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
         {"msToken": "token-1", "sessionid": "sess", "sid_tt": "sid-tt"}
     )
     progress_events = []
+    signed_calls = []
+
+    async def _fake_cancel_like(page, aweme_id):
+        assert page is not None
+        signed_calls.append({"aweme_id": aweme_id})
+        if aweme_id == "111":
+            return {"http_status": 200, "status_code": 0, "status_msg": ""}
+        return {
+            "http_status": 200,
+            "status_code": 5,
+            "status_msg": "failed",
+        }
+
+    monkeypatch.setattr(client, "_cancel_like_via_bulk_manage", _fake_cancel_like)
 
     result = asyncio.run(
         client.cancel_likes_via_browser(
@@ -274,9 +342,9 @@ def test_cancel_likes_via_browser_uses_sensitive_cookies(monkeypatch):
     assert result["failed_ids"] == ["222"]
     assert any(cookie["name"] == "sessionid" for cookie in context.added_cookies)
     assert any(cookie["name"] == "sid_tt" for cookie in context.added_cookies)
-    assert page.evaluate_payloads == [
-        {"aweme_id": "111", "type_value": 0},
-        {"aweme_id": "222", "type_value": 0},
+    assert signed_calls == [
+        {"aweme_id": "111"},
+        {"aweme_id": "222"},
     ]
     assert [event["status"] for event in progress_events] == ["success", "failed"]
 
@@ -287,7 +355,6 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
     class _FakePage:
         def __init__(self):
             self.context = None
-            self.evaluate_payloads = []
 
         async def goto(self, *args, **kwargs):
             return
@@ -300,10 +367,6 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
 
         async def wait_for_timeout(self, _ms):
             return
-
-        async def evaluate(self, _script, payload):
-            self.evaluate_payloads.append(dict(payload))
-            return {"http_status": 200, "status_code": 0, "status_msg": ""}
 
     class _FakeContext:
         def __init__(self, page):
@@ -371,6 +434,14 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
         {"msToken": "token-1", "sessionid": "sess", "sid_tt": "sid-tt"}
     )
     profile_dir = tmp_path / "profile"
+    signed_calls = []
+
+    async def _fake_cancel_like(page, aweme_id):
+        assert page is not None
+        signed_calls.append({"aweme_id": aweme_id})
+        return {"http_status": 200, "status_code": 0, "status_msg": ""}
+
+    monkeypatch.setattr(client, "_cancel_like_via_bulk_manage", _fake_cancel_like)
 
     result = asyncio.run(
         client.cancel_likes_via_browser(
@@ -385,8 +456,10 @@ def test_cancel_likes_via_browser_uses_persistent_context_when_profile_dir_provi
     assert result["success_ids"] == ["111"]
     assert chromium.persistent_calls[0]["user_data_dir"] == str(profile_dir)
     assert profile_dir.exists() is True
-    assert context.added_cookies == []
-    assert page.evaluate_payloads == [{"aweme_id": "111", "type_value": 0}]
+    added_names = {cookie["name"] for cookie in context.added_cookies}
+    assert {"msToken", "sid_tt"} <= added_names
+    assert "sessionid" not in added_names
+    assert signed_calls == [{"aweme_id": "111"}]
 
 
 def test_cancel_likes_via_browser_fails_fast_when_login_ui_still_visible(
