@@ -738,6 +738,68 @@ def test_cancel_likes_via_browser_batches_requests(monkeypatch):
     assert len(progress_events) == 9
 
 
+def test_find_like_item_link_waits_for_scroller_after_reload():
+    class _FakeMouse:
+        async def wheel(self, _x, _y):
+            return
+
+    class _FakeLocator:
+        def __init__(self, count_func, evaluate_func=None):
+            self._count_func = count_func
+            self._evaluate_func = evaluate_func
+            self.first = self
+
+        async def count(self):
+            return self._count_func()
+
+        async def evaluate(self, script):
+            if self._evaluate_func is None:
+                return None
+            return self._evaluate_func(script)
+
+    class _FakePage:
+        def __init__(self):
+            self.mouse = _FakeMouse()
+            self.wait_calls = 0
+            self.scroll_top = 0
+
+        def is_closed(self):
+            return False
+
+        def locator(self, selector):
+            if selector.startswith('a[href="/video/222"]'):
+                return _FakeLocator(lambda: 1 if self.wait_calls >= 2 else 0)
+            if selector.startswith("div.parent-route-container.route-scroll-container"):
+                return _FakeLocator(
+                    lambda: 1 if self.wait_calls >= 2 else 0,
+                    self._evaluate_scroller,
+                )
+            raise AssertionError(f"unexpected selector: {selector}")
+
+        async def wait_for_timeout(self, _ms):
+            self.wait_calls += 1
+
+        def _evaluate_scroller(self, script):
+            if "scrollTo" in script:
+                self.scroll_top = 0
+                return None
+            if "scrollBy" in script:
+                previous = self.scroll_top
+                self.scroll_top += 1600
+                return previous
+            if "scrollTop" in script:
+                return self.scroll_top
+            raise AssertionError(f"unexpected script: {script}")
+
+    client = DouyinAPIClient({"sessionid": "sess", "sid_tt": "sid-tt"})
+    page = _FakePage()
+
+    link = asyncio.run(client._find_like_item_link(page, "222"))
+
+    assert link is not None
+    assert page.wait_calls >= 2
+
+
 def test_cancel_likes_via_browser_fails_fast_when_login_ui_still_visible(
     monkeypatch,
 ):

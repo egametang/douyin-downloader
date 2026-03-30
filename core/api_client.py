@@ -1742,13 +1742,12 @@ async ({ aweme_id, type_value }) => {
         except Exception:
             pass
 
-        scroller = page.locator(
-            "div.parent-route-container.route-scroll-container, "
-            "div.parent-route-container.XoIW2IMs.route-scroll-container"
-        ).first
+        scroller = await self._wait_for_like_list_scroller(page)
+        if scroller is None:
+            logger.debug("Like list scroller not ready while finding aweme %s", aweme_id)
+            return None
+
         try:
-            if await scroller.count() == 0:
-                return None
             await scroller.evaluate("(el) => { el.scrollTo(0, 0); }")
             await page.wait_for_timeout(500)
         except Exception as exc:
@@ -1787,6 +1786,25 @@ async ({ aweme_id, type_value }) => {
                 return link
         except Exception:
             pass
+        return None
+
+    async def _wait_for_like_list_scroller(self, page, *, timeout_ms: int = 10_000):
+        scroller = page.locator(
+            "div.parent-route-container.route-scroll-container, "
+            "div.parent-route-container.XoIW2IMs.route-scroll-container"
+        ).first
+        deadline = asyncio.get_running_loop().time() + max(
+            1.0, float(timeout_ms) / 1000.0
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed():
+                return None
+            try:
+                if await scroller.count() > 0:
+                    return scroller
+            except Exception as exc:
+                logger.debug("Check like list scroller failed: %s", exc)
+            await page.wait_for_timeout(250)
         return None
 
     async def _select_like_items_for_bulk_manage(
