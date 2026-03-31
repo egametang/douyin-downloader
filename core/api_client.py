@@ -1733,7 +1733,13 @@ async ({ aweme_id, type_value }) => {
             await page.wait_for_timeout(500)
         return False
 
-    async def _find_like_item_link(self, page, aweme_id: str):
+    async def _find_like_item_link(
+        self,
+        page,
+        aweme_id: str,
+        *,
+        max_scroll_rounds: int = 120,
+    ):
         selector = self._like_item_link_selector(aweme_id)
         link = page.locator(selector).first
         try:
@@ -1754,7 +1760,7 @@ async ({ aweme_id, type_value }) => {
             logger.debug("Reset like list scroll position failed: %s", exc)
 
         stagnant_rounds = 0
-        for _ in range(120):
+        for _ in range(max(1, int(max_scroll_rounds or 0))):
             try:
                 if await link.count() > 0:
                     return link
@@ -1912,56 +1918,19 @@ async ({ aweme_id, type_value }) => {
                 "body": "",
             }
 
-        if not verify_aweme_id:
+        await page.wait_for_timeout(1200)
+        if not await self._page_ready_for_like_actions(page):
             return {
                 "http_status": 200,
-                "status_code": 0,
-                "status_msg": "",
+                "status_code": 8,
+                "status_msg": "用户未登录",
                 "body": "",
             }
 
-        for _ in range(12):
-            if not await self._page_ready_for_like_actions(page):
-                return {
-                    "http_status": 200,
-                    "status_code": 8,
-                    "status_msg": "用户未登录",
-                    "body": "",
-                }
-
-            link = await self._find_like_item_link(page, verify_aweme_id)
-            if link is None:
-                return {
-                    "http_status": 200,
-                    "status_code": 0,
-                    "status_msg": "",
-                    "body": "",
-                }
-            await page.wait_for_timeout(500)
-
-        try:
-            await page.goto(
-                f"{self.BASE_URL}/user/self?showTab=like",
-                wait_until="domcontentloaded",
-                timeout=15_000,
-            )
-        except Exception as exc:
-            logger.debug("Reload like page for bulk unlike verification failed: %s", exc)
-        else:
-            if await self._page_ready_for_like_actions(page):
-                link = await self._find_like_item_link(page, verify_aweme_id)
-                if link is None:
-                    return {
-                        "http_status": 200,
-                        "status_code": 0,
-                        "status_msg": "",
-                        "body": "",
-                    }
-
         return {
             "http_status": 200,
-            "status_code": 5,
-            "status_msg": "bulk_unlike_not_confirmed",
+            "status_code": 0,
+            "status_msg": "",
             "body": "",
         }
 

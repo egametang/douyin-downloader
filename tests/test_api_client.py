@@ -800,6 +800,59 @@ def test_find_like_item_link_waits_for_scroller_after_reload():
     assert page.wait_calls >= 2
 
 
+def test_submit_like_bulk_unlike_skips_scroll_verification_after_confirm(monkeypatch):
+    class _FakeAction:
+        def __init__(self):
+            self.click_calls = 0
+
+        async def click(self, timeout=None):
+            assert timeout == 10_000
+            self.click_calls += 1
+
+    class _FakePage:
+        def __init__(self):
+            self.cancel = _FakeAction()
+            self.confirm = _FakeAction()
+            self.goto_calls = []
+            self.wait_calls = []
+
+        def get_by_text(self, text, exact=True):
+            assert exact is True
+            if text == "取消喜欢":
+                return self.cancel
+            if text == "确认取消":
+                return self.confirm
+            raise AssertionError(f"unexpected text: {text}")
+
+        async def goto(self, url, wait_until=None, timeout=None):
+            self.goto_calls.append(
+                {
+                    "url": url,
+                    "wait_until": wait_until,
+                    "timeout": timeout,
+                }
+            )
+
+        async def wait_for_timeout(self, ms):
+            self.wait_calls.append(ms)
+
+    client = DouyinAPIClient({"sessionid": "sess", "sid_tt": "sid-tt"})
+    page = _FakePage()
+    async def _page_ready(_page):
+        assert _page is page
+        return True
+
+    monkeypatch.setattr(client, "_page_ready_for_like_actions", _page_ready)
+
+    result = asyncio.run(client._submit_like_bulk_unlike(page, verify_aweme_id="222"))
+
+    assert result["status_code"] == 0
+    assert page.cancel.click_calls == 1
+    assert page.confirm.click_calls == 1
+    assert page.wait_calls == [1200]
+    assert page.goto_calls == []
+
+
 def test_cancel_likes_via_browser_fails_fast_when_login_ui_still_visible(
     monkeypatch,
 ):

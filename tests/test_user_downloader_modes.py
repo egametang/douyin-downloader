@@ -213,6 +213,25 @@ def test_user_downloader_supports_self_collect_mode(tmp_path, monkeypatch):
     assert downloader.api_client.user_info_calls == []
 
 
+def test_user_downloader_supports_self_like_mode(tmp_path, monkeypatch):
+    downloader = _build_downloader(tmp_path, mode=["like"])
+
+    async def _always_true(*_args, **_kwargs):
+        return True
+
+    async def _download_ok(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(downloader, "_should_download", _always_true)
+    monkeypatch.setattr(downloader, "_download_aweme_assets", _download_ok)
+
+    result = asyncio.run(downloader.download({"sec_uid": "self"}))
+
+    assert result.total == 2
+    assert result.success == 2
+    assert downloader.api_client.user_info_calls == []
+
+
 def test_user_downloader_rejects_non_self_collect_mode(tmp_path, monkeypatch):
     downloader = _build_downloader(tmp_path, mode=["collect"])
 

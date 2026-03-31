@@ -12,6 +12,7 @@ logger = setup_logger("UserDownloader")
 
 class UserDownloader(BaseDownloader):
     SELF_COLLECT_MODES = {"collect", "collectmix"}
+    SELF_CONTEXT_MODES = SELF_COLLECT_MODES | {"like"}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -186,8 +187,12 @@ class UserDownloader(BaseDownloader):
         self, sec_uid: str, modes: List[str]
     ) -> Optional[Dict[str, Any]]:
         normalized_modes = {str(mode or "").strip() for mode in modes}
-        if sec_uid == "self" and normalized_modes.issubset(self.SELF_COLLECT_MODES):
-            self._progress_update_step("获取作者信息", "使用当前登录账号收藏夹上下文")
+        if sec_uid == "self" and normalized_modes.issubset(self.SELF_CONTEXT_MODES):
+            if normalized_modes.issubset(self.SELF_COLLECT_MODES):
+                detail = "使用当前登录账号收藏夹上下文"
+            else:
+                detail = "使用当前登录账号上下文"
+            self._progress_update_step("获取作者信息", detail)
             return {
                 "uid": "self",
                 "sec_uid": "self",
