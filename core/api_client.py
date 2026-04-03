@@ -635,10 +635,10 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
                             break
+                        before = len(ids)
                         await page.mouse.wheel(0, 3800)
                         await page.wait_for_timeout(1200)
 
-                        before = len(ids)
                         _merge(await self._extract_aweme_ids_from_page(page))
                         if len(ids) == before:
                             stable_rounds += 1
@@ -874,6 +874,7 @@ class DouyinAPIClient:
                             logger.warning("Browser page closed during like fallback scrolling")
                             break
 
+                        before = len(ids)
                         if has_scroller:
                             try:
                                 await scroller.evaluate("(el) => { el.scrollBy(0, 1600); }")
@@ -884,7 +885,6 @@ class DouyinAPIClient:
                             await page.mouse.wheel(0, 3200)
                         await page.wait_for_timeout(1200)
 
-                        before = len(ids)
                         if len(ids) == before:
                             stable_rounds += 1
                         else:
