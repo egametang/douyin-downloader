@@ -34,17 +34,34 @@ class MixDownloader(BaseDownloader):
         async def _process_aweme(item: Dict[str, Any]):
             aweme_id = item.get("aweme_id")
             if not aweme_id:
-                self._progress_advance_item("failed", "missing_aweme_id")
-                return {"status": "failed", "aweme_id": None}
+                reason = "缺少作品 ID"
+                self._progress_advance_item("failed", reason)
+                return {"status": "failed", "aweme_id": None, "reason": reason}
 
             if not await self._should_download(str(aweme_id)):
-                self._progress_advance_item("skipped", str(aweme_id))
-                return {"status": "skipped", "aweme_id": aweme_id}
+                reason = (
+                    await self._download_skip_reason(str(aweme_id))
+                    or "下载条件不满足"
+                )
+                self._progress_advance_item("skipped", f"{aweme_id} - {reason}")
+                return {
+                    "status": "skipped",
+                    "aweme_id": aweme_id,
+                    "item_name": self._item_name(aweme_id, item),
+                    "reason": reason,
+                }
 
             success = await self._download_aweme_assets(item, author_name, mode="mix")
             status = "success" if success else "failed"
-            self._progress_advance_item(status, str(aweme_id))
-            return {"status": status, "aweme_id": aweme_id}
+            reason = "" if success else self._download_failure_reason(item)
+            detail = str(aweme_id) if success else f"{aweme_id} - {reason}"
+            self._progress_advance_item(status, detail)
+            return {
+                "status": status,
+                "aweme_id": aweme_id,
+                "item_name": self._item_name(aweme_id, item),
+                "reason": reason,
+            }
 
         download_results = await self.queue_manager.download_batch(
             _process_aweme, aweme_list
@@ -54,9 +71,20 @@ class MixDownloader(BaseDownloader):
             if status == "success":
                 result.success += 1
             elif status == "skipped":
-                result.skipped += 1
+                result.record_skipped(
+                    entry.get("aweme_id"),
+                    entry.get("item_name"),
+                    entry.get("reason", "下载条件不满足"),
+                )
             else:
-                result.failed += 1
+                reason = "资源下载失败"
+                if isinstance(entry, dict):
+                    reason = entry.get("reason", reason)
+                result.record_failed(
+                    entry.get("aweme_id") if isinstance(entry, dict) else None,
+                    entry.get("item_name") if isinstance(entry, dict) else None,
+                    reason,
+                )
         return result
 
     async def _collect_mix_aweme_list(self, mix_id: str) -> List[Dict[str, Any]]:

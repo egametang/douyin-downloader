@@ -37,9 +37,45 @@ class DownloadResult:
         self.failed = 0
         self.skipped = 0
         self.success_aweme_ids: List[str] = []
+        self.failed_items: List[Dict[str, str]] = []
+        self.skipped_items: List[Dict[str, str]] = []
 
     def __str__(self):
         return f"Total: {self.total}, Success: {self.success}, Failed: {self.failed}, Skipped: {self.skipped}"
+
+    def record_failed(
+        self, item_id: Any, item_name: Optional[str] = None, reason: str = "unknown"
+    ) -> None:
+        self.failed += 1
+        self.failed_items.append(self._issue_item(item_id, item_name, reason))
+
+    def record_skipped(
+        self, item_id: Any, item_name: Optional[str] = None, reason: str = "unknown"
+    ) -> None:
+        self.skipped += 1
+        self.skipped_items.append(self._issue_item(item_id, item_name, reason))
+
+    def absorb(self, other: "DownloadResult") -> None:
+        self.total += other.total
+        self.success += other.success
+        self.failed += other.failed
+        self.skipped += other.skipped
+        self.success_aweme_ids.extend(other.success_aweme_ids)
+        self.failed_items.extend(other.failed_items)
+        self.skipped_items.extend(other.skipped_items)
+
+    @staticmethod
+    def _issue_item(
+        item_id: Any, item_name: Optional[str], reason: str
+    ) -> Dict[str, str]:
+        normalized_id = str(item_id or "unknown").strip() or "unknown"
+        normalized_name = str(item_name or normalized_id).strip() or normalized_id
+        normalized_reason = str(reason or "unknown").strip() or "unknown"
+        return {
+            "item_id": normalized_id,
+            "item_name": normalized_name,
+            "reason": normalized_reason,
+        }
 
 
 class BaseDownloader(ABC):
@@ -135,27 +171,61 @@ class BaseDownloader(ABC):
     async def download(self, parsed_url: Dict[str, Any]) -> DownloadResult:
         pass
 
-    async def _should_download(self, aweme_id: str) -> bool:
+    async def _download_skip_reason(self, aweme_id: str) -> Optional[str]:
+        if not aweme_id:
+            return "缺少作品 ID"
+
         in_local = self._is_locally_downloaded(aweme_id)
         in_db = False
         if self.database:
             in_db = await self.database.is_downloaded(aweme_id)
 
         if in_db and in_local:
-            return False
+            logger.info(
+                "Aweme %s already exists in database and locally, skipping",
+                aweme_id,
+            )
+            return "数据库和本地文件已存在"
 
         if in_db and not in_local:
             logger.info(
                 "Aweme %s exists in database but media file not found locally, retry download",
                 aweme_id,
             )
-            return True
+            return None
 
         if in_local:
             logger.info("Aweme %s already exists locally, skipping", aweme_id)
-            return False
+            return "本地文件已存在"
 
-        return True
+        return None
+
+    async def _should_download(self, aweme_id: str) -> bool:
+        return await self._download_skip_reason(aweme_id) is None
+
+    @staticmethod
+    def _item_name(item_id: Any, item_data: Optional[Dict[str, Any]] = None) -> str:
+        normalized_id = str(item_id or "unknown").strip() or "unknown"
+        if not isinstance(item_data, dict):
+            return normalized_id
+        desc = str(item_data.get("desc") or "").strip()
+        if not desc:
+            return normalized_id
+        return f"{desc} ({normalized_id})"
+
+    @staticmethod
+    def _set_download_failure(aweme_data: Dict[str, Any], reason: str) -> bool:
+        if isinstance(aweme_data, dict):
+            aweme_data["_download_failure_reason"] = reason
+        return False
+
+    @staticmethod
+    def _download_failure_reason(
+        aweme_data: Dict[str, Any], default: str = "资源下载失败"
+    ) -> str:
+        if not isinstance(aweme_data, dict):
+            return default
+        return str(aweme_data.get("_download_failure_reason") or default)
 
     def _is_locally_downloaded(self, aweme_id: str) -> bool:
         if not aweme_id:
@@ -244,7 +314,7 @@ class BaseDownloader(ABC):
         aweme_id = aweme_data.get("aweme_id")
         if not aweme_id:
             logger.error("Missing aweme_id in aweme data")
-            return False
+            return self._set_download_failure(aweme_data, "缺少作品 ID")
 
         desc = (aweme_data.get("desc", "no_title") or "").strip() or "no_title"
         publish_ts, publish_date = self._resolve_publish_time(
@@ -302,7 +372,7 @@ class BaseDownloader(ABC):
             video_plan = self._build_video_download_plan(aweme_data)
             if not original_request and not video_plan:
                 logger.error("No playable video URL found for aweme %s", aweme_id)
-                return False
+                return self._set_download_failure(aweme_data, "没有可播放的视频地址")
 
             video_path = save_dir / f"{file_stem}.mp4"
             if original_request:
@@ -331,7 +401,10 @@ class BaseDownloader(ABC):
                         fallback_request = self._build_no_watermark_url(aweme_data)
                         if not fallback_request:
                             _cleanup_partial_downloads()
-                            return False
+                            return self._set_download_failure(
+                                aweme_data,
+                                "DASH 下载失败，且没有可用 MP4 回退地址",
+                            )
                         if not await self._download_with_retry(
                             fallback_request[0],
                             video_path,
@@ -339,7 +412,9 @@ class BaseDownloader(ABC):
                             headers=fallback_request[1],
                         ):
                             _cleanup_partial_downloads()
-                            return False
+                            return self._set_download_failure(
+                                aweme_data, "MP4 回退视频下载失败"
+                            )
                         video_variant = "progressive_mp4"
                     else:
                         video_variant = "dash_original"
@@ -350,8 +425,12 @@ class BaseDownloader(ABC):
                         video_url, video_path, session, headers=video_headers
                     ):
                         _cleanup_partial_downloads()
-                        return False
+                        return self._set_download_failure(aweme_data, "视频下载失败")
                     video_variant = "progressive_mp4"
+
+            if video_variant is None:
+                _cleanup_partial_downloads()
+                return self._set_download_failure(aweme_data, "视频下载失败")
 
             downloaded_files.append(video_path)
 
@@ -403,7 +482,7 @@ class BaseDownloader(ABC):
                     "image_post_info" in aweme_data,
                     "images" in aweme_data,
                 )
-                return False
+                return self._set_download_failure(aweme_data, "没有可下载的图集资源")
 
             for index, image_candidates in enumerate(image_url_candidates, start=1):
                 suffix = self._infer_image_extension(image_candidates[0])
@@ -421,7 +500,9 @@ class BaseDownloader(ABC):
                         f"Failed downloading image {index} for aweme {aweme_id}"
                     )
                     _cleanup_partial_downloads()
-                    return False
+                    return self._set_download_failure(
+                        aweme_data, f"图集第 {index} 张图片下载失败"
+                    )
                 downloaded_files.append(
                     download_result if isinstance(download_result, Path) else image_path
                 )
@@ -440,11 +521,15 @@ class BaseDownloader(ABC):
                         f"Failed downloading live image {index} for aweme {aweme_id}"
                     )
                     _cleanup_partial_downloads()
-                    return False
+                    return self._set_download_failure(
+                        aweme_data, f"图集第 {index} 个实况资源下载失败"
+                    )
                 downloaded_files.append(live_path)
         else:
             logger.error("Unsupported media type for aweme %s: %s", aweme_id, media_type)
-            return False
+            return self._set_download_failure(
+                aweme_data, f"不支持的媒体类型: {media_type}"
+            )
 
         if self.config.get("avatar"):
             author = aweme_data.get("author", {})

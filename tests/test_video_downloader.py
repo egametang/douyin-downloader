@@ -77,6 +77,56 @@ async def test_video_downloader_skip_counts_total(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_video_downloader_records_skip_reason(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    async def _fake_skip_reason(_aweme_id):
+        return "已存在本地文件"
+
+    monkeypatch.setattr(downloader, "_download_skip_reason", _fake_skip_reason)
+
+    result = await downloader.download({"aweme_id": "123"})
+
+    assert result.skipped == 1
+    assert result.skipped_items == [
+        {
+            "item_id": "123",
+            "item_name": "123",
+            "reason": "已存在本地文件",
+        }
+    ]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
+async def test_video_downloader_records_detail_failure_reason(tmp_path, monkeypatch):
+    downloader, api_client = _build_downloader(tmp_path)
+
+    async def _fake_skip_reason(_aweme_id):
+        return None
+
+    async def _fake_get_video_detail(_aweme_id):
+        return None
+
+    monkeypatch.setattr(downloader, "_download_skip_reason", _fake_skip_reason)
+    monkeypatch.setattr(api_client, "get_video_detail", _fake_get_video_detail)
+
+    result = await downloader.download({"aweme_id": "123"})
+
+    assert result.failed == 1
+    assert result.failed_items == [
+        {
+            "item_id": "123",
+            "item_name": "123",
+            "reason": "获取视频详情失败",
+        }
+    ]
+
+    await api_client.close()
+
+
+@pytest.mark.asyncio
 async def test_video_downloader_reports_item_progress(tmp_path, monkeypatch):
     downloader, api_client = _build_downloader(tmp_path)
     reporter = _FakeProgressReporter()

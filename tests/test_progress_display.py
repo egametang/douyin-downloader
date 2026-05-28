@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+from rich.console import Console
+
+from core.downloader_base import DownloadResult
 from cli.progress_display import ProgressDisplay
 
 
@@ -43,6 +46,45 @@ class _FakeProgressContext:
 
     def __exit__(self, *_args):
         self.exited = True
+
+
+class _FakeConsole:
+    def __init__(self):
+        self.messages = []
+
+    def print(self, *args, **kwargs):
+        self.messages.append((args, kwargs))
+
+
+def test_show_banner_does_not_print_tool_title():
+    display = ProgressDisplay()
+    fake_console = _FakeConsole()
+    display.console = fake_console
+
+    display.show_banner()
+
+    assert fake_console.messages == []
+
+
+def test_show_result_renders_failed_and_skipped_reasons():
+    display = ProgressDisplay()
+    console = Console(record=True, width=120)
+    display.console = console
+    result = DownloadResult()
+    result.total = 3
+    result.success = 1
+    result.record_skipped("222", "already downloaded item", "已存在本地文件")
+    result.record_failed("333", "broken item", "获取视频详情失败")
+
+    display.show_result(result)
+
+    output = console.export_text()
+    assert "Skipped Details" in output
+    assert "already downloaded item" in output
+    assert "已存在本地文件" in output
+    assert "Failed Details" in output
+    assert "broken item" in output
+    assert "获取视频详情失败" in output
 
 
 def test_single_url_overall_progress_follows_item_count(monkeypatch):

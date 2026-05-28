@@ -20,9 +20,10 @@ class VideoDownloader(BaseDownloader):
         self._progress_update_step("下载作品", "单视频资源下载中")
 
         if not await self._should_download(aweme_id):
+            reason = await self._download_skip_reason(aweme_id) or "下载条件不满足"
             logger.info("Video %s already downloaded, skipping", aweme_id)
-            result.skipped += 1
-            self._progress_advance_item("skipped", str(aweme_id))
+            result.record_skipped(aweme_id, str(aweme_id), reason)
+            self._progress_advance_item("skipped", f"{aweme_id} - {reason}")
             return result
 
         await self.rate_limiter.acquire()
@@ -30,8 +31,8 @@ class VideoDownloader(BaseDownloader):
         aweme_data = await self.api_client.get_video_detail(aweme_id)
         if not aweme_data:
             logger.error("Failed to get video detail: %s", aweme_id)
-            result.failed += 1
-            self._progress_advance_item("failed", str(aweme_id))
+            result.record_failed(aweme_id, str(aweme_id), "获取视频详情失败")
+            self._progress_advance_item("failed", f"{aweme_id} - 获取视频详情失败")
             return result
 
         success = await self._download_aweme(aweme_data)
@@ -39,8 +40,11 @@ class VideoDownloader(BaseDownloader):
             result.success += 1
             self._progress_advance_item("success", str(aweme_id))
         else:
-            result.failed += 1
-            self._progress_advance_item("failed", str(aweme_id))
+            reason = self._download_failure_reason(aweme_data)
+            result.record_failed(
+                aweme_id, self._item_name(aweme_id, aweme_data), reason
+            )
+            self._progress_advance_item("failed", f"{aweme_id} - {reason}")
 
         return result
 

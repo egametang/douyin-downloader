@@ -57,10 +57,7 @@ class UserDownloader(BaseDownloader):
             mode_result = await strategy.download_mode(
                 sec_uid, user_info, seen_aweme_ids=seen_aweme_ids
             )
-            result.total += mode_result.total
-            result.success += mode_result.success
-            result.failed += mode_result.failed
-            result.skipped += mode_result.skipped
+            result.absorb(mode_result)
             if mode == "like" and mode_result.success_aweme_ids:
                 like_cleanup_aweme_ids.extend(mode_result.success_aweme_ids)
 
@@ -245,15 +242,34 @@ class UserDownloader(BaseDownloader):
         async def _process_aweme(item: Dict[str, Any]):
             aweme_id = item.get("aweme_id")
             if not await self._should_download(str(aweme_id or "")):
-                self._progress_advance_item("skipped", str(aweme_id or "unknown"))
-                return {"status": "skipped", "aweme_id": aweme_id}
+                reason = (
+                    await self._download_skip_reason(str(aweme_id or ""))
+                    or "下载条件不满足"
+                )
+                self._progress_advance_item(
+                    "skipped", f"{aweme_id or 'unknown'} - {reason}"
+                )
+                return {
+                    "status": "skipped",
+                    "aweme_id": aweme_id,
+                    "item_name": self._item_name(aweme_id, item),
+                    "reason": reason,
+                }
 
             success = await self._download_aweme_assets(item, author_name, mode=mode)
             status = "success" if success else "failed"
-            self._progress_advance_item(status, str(aweme_id or "unknown"))
+            reason = "" if success else self._download_failure_reason(item)
+            detail = (
+                str(aweme_id or "unknown")
+                if success
+                else f"{aweme_id or 'unknown'} - {reason}"
+            )
+            self._progress_advance_item(status, detail)
             return {
                 "status": status,
                 "aweme_id": aweme_id,
+                "item_name": self._item_name(aweme_id, item),
+                "reason": reason,
             }
 
         download_results = await self.queue_manager.download_batch(
@@ -268,11 +284,19 @@ class UserDownloader(BaseDownloader):
                 if aweme_id:
                     result.success_aweme_ids.append(aweme_id)
             elif status == "failed":
-                result.failed += 1
+                result.record_failed(
+                    entry.get("aweme_id"),
+                    entry.get("item_name"),
+                    entry.get("reason", "资源下载失败"),
+                )
             elif status == "skipped":
-                result.skipped += 1
+                result.record_skipped(
+                    entry.get("aweme_id"),
+                    entry.get("item_name"),
+                    entry.get("reason", "下载条件不满足"),
+                )
             else:
-                result.failed += 1
+                result.record_failed("unknown", "unknown", "未知下载结果")
                 self._progress_advance_item("failed", "unknown")
 
         return result

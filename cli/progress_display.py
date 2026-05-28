@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, List, Optional
 
 from rich.console import Console
 from rich.progress import (
@@ -35,13 +35,7 @@ class ProgressDisplay:
         self._item_stats = {"success": 0, "failed": 0, "skipped": 0}
 
     def show_banner(self):
-        banner = """
-╔══════════════════════════════════════════╗
-║     Douyin Downloader v2.0.0            ║
-║     抖音批量下载工具                     ║
-╚══════════════════════════════════════════╝
-        """
-        self._active_console().print(banner, style="bold cyan")
+        return
 
     def create_progress(self) -> Progress:
         return Progress(
@@ -242,6 +236,12 @@ class ProgressDisplay:
             table.add_row("Success Rate", f"{success_rate:.1f}%")
 
         self._active_console().print(table)
+        self._print_issue_details(
+            "Failed Details", getattr(result, "failed_items", []) or []
+        )
+        self._print_issue_details(
+            "Skipped Details", getattr(result, "skipped_items", []) or []
+        )
 
     def print_info(self, message: str):
         self._active_console().print(f"[blue]ℹ[/blue] {message}")
@@ -283,6 +283,21 @@ class ProgressDisplay:
         if self._progress:
             return self._progress.console
         return self.console
+
+    def _print_issue_details(self, title: str, items: List[Dict[str, str]]) -> None:
+        if not items:
+            return
+        table = Table(title=title, show_header=True, header_style="bold magenta")
+        table.add_column("Item", style="cyan", overflow="fold")
+        table.add_column("ID", style="dim", no_wrap=True)
+        table.add_column("Reason", style="yellow", overflow="fold")
+        for item in items:
+            table.add_row(
+                str(item.get("item_name") or item.get("item_id") or "unknown"),
+                str(item.get("item_id") or "unknown"),
+                str(item.get("reason") or "unknown"),
+            )
+        self._active_console().print(table)
 
     @staticmethod
     def _shorten(text: str, max_len: int = 60) -> str:

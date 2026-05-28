@@ -292,6 +292,20 @@ def test_user_post_reports_step_and_item_progress(tmp_path, monkeypatch):
     assert statuses.count("success") == 1
     assert statuses.count("skipped") == 1
     assert statuses.count("failed") == 1
+    assert result.skipped_items == [
+        {
+            "item_id": "222",
+            "item_name": "desc-222 (222)",
+            "reason": "下载条件不满足",
+        }
+    ]
+    assert result.failed_items == [
+        {
+            "item_id": "333",
+            "item_name": "desc-333 (333)",
+            "reason": "资源下载失败",
+        }
+    ]
 
 
 def test_user_like_browser_fallback_recovers_missing_items(tmp_path):

@@ -35,16 +35,21 @@ class MusicDownloader(BaseDownloader):
                 result.success += 1
                 self._progress_advance_item("success", str(music_id))
             else:
-                result.failed += 1
-                self._progress_advance_item("failed", str(music_id))
+                reason = "音乐文件下载失败"
+                result.record_failed(music_id, str(music_id), reason)
+                self._progress_advance_item("failed", f"{music_id} - {reason}")
             return result
 
         # 回退：音乐详情无法直接拿到音频链接时，尝试下载该音乐下的首条作品
         aweme = await self._get_first_music_aweme(str(music_id))
         if aweme and aweme.get("aweme_id"):
             if not await self._should_download(str(aweme.get("aweme_id"))):
-                result.skipped += 1
-                self._progress_advance_item("skipped", str(aweme.get("aweme_id")))
+                aweme_id = str(aweme.get("aweme_id"))
+                reason = await self._download_skip_reason(aweme_id) or "下载条件不满足"
+                result.record_skipped(
+                    aweme_id, self._item_name(aweme_id, aweme), reason
+                )
+                self._progress_advance_item("skipped", f"{aweme_id} - {reason}")
                 return result
 
             aweme_author = (aweme.get("author") or {}).get("nickname", "music")
@@ -53,13 +58,18 @@ class MusicDownloader(BaseDownloader):
                 result.success += 1
                 self._progress_advance_item("success", str(aweme.get("aweme_id")))
             else:
-                result.failed += 1
-                self._progress_advance_item("failed", str(aweme.get("aweme_id")))
+                aweme_id = str(aweme.get("aweme_id"))
+                reason = self._download_failure_reason(aweme)
+                result.record_failed(
+                    aweme_id, self._item_name(aweme_id, aweme), reason
+                )
+                self._progress_advance_item("failed", f"{aweme_id} - {reason}")
             return result
 
         logger.error("No playable music source found for music_id=%s", music_id)
-        result.failed += 1
-        self._progress_advance_item("failed", str(music_id))
+        reason = "没有可播放的音乐资源"
+        result.record_failed(music_id, str(music_id), reason)
+        self._progress_advance_item("failed", f"{music_id} - {reason}")
         return result
 
     async def _download_music_asset(

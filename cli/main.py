@@ -209,17 +209,14 @@ async def main_async(args):
         from core.downloader_base import DownloadResult
         total_result = DownloadResult()
         for r in all_results:
-            total_result.total += r.total
-            total_result.success += r.success
-            total_result.failed += r.failed
-            total_result.skipped += r.skipped
+            total_result.absorb(r)
 
         display.print_success("\n=== Overall Summary ===")
         display.show_result(total_result)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Douyin Downloader - 抖音批量下载工具')
+    parser = argparse.ArgumentParser(description='Douyin media batch downloader')
     parser.add_argument('-u', '--url', action='append', help='Download URL(s)')
     parser.add_argument('-c', '--config', help='Config file path (default: config.yml)')
     parser.add_argument('-p', '--path', help='Save path')
